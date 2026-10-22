@@ -12,9 +12,9 @@ description: >
   hojas de cálculo. No usar para editar formato de Excel, PDFs, scraping ni
   dashboards.
 license: MIT
-compatibility: Requiere uv, Python 3.12+ y SQLite. Solo entrada CSV.
+compatibility: Requiere uv, Python 3.12+ y SQLite. Solo entrada CSV. Funciona en Windows, macOS y Linux.
 metadata:
-  version: "0.1.0"
+  version: "0.2.0-rc1"
   opencode/slash: "true"
 ---
 
@@ -36,6 +36,16 @@ cualquier hoja de cálculo:
 4. Espera el CSV antes de crear el proyecto.
 
 `tabular.py` también rechaza cualquier archivo que no termine en `.csv`.
+
+## Requisitos
+
+- `uv` instalado y disponible en el PATH.
+- Python 3.12 gestionado por uv; no hace falta instalarlo a mano.
+- `pandas` en el entorno del proyecto (`uv add pandas`).
+- SQLite viene incluido en Python; no instales el CLI.
+- Windows: instala uv con `winget install --id=astral-sh.uv -e` o con
+  `powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"`,
+  y reinicia la terminal.
 
 ## Principios
 
@@ -68,6 +78,11 @@ Si el archivo no es `.csv`, aplica la regla de entrada y detente.
 
 ### 1. Crear el proyecto con uv
 
+Elige el bloque según tu shell. Los comandos `uv run python ...` posteriores
+son idénticos en todos los sistemas.
+
+#### Linux, macOS o Git Bash
+
 Ejecuta desde el directorio donde quieras crear el proyecto:
 
 ```bash
@@ -95,6 +110,48 @@ EOF
 
 No sobrescribas un proyecto existente. Si la carpeta ya existe, pregunta si
 continuar, usar otro nombre o actualizar el proyecto.
+
+#### Windows (PowerShell)
+
+Si la skill está instalada en `.config\opencode\skills`, ajusta `$SkillDir`.
+No uses `mkdir -p`, `cp` ni here-documents de Bash.
+
+```powershell
+$SkillDir = Join-Path $env:USERPROFILE ".agents\skills\tabular"
+$Project  = "ventas_enero"
+$Csv      = "C:\datos\ventas_enero.csv"
+
+uv init --bare --python 3.12 --name $Project $Project
+Set-Location $Project
+uv python pin 3.12
+uv add pandas
+
+$dirs = @("data\raw", "db", "schema", "sql\views", "sql\queries", "functions", "reports", "scripts")
+foreach ($dir in $dirs) {
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+}
+
+Copy-Item (Join-Path $SkillDir "scripts\tabular.py") "scripts\tabular.py"
+Copy-Item $Csv (Join-Path "data\raw" (Split-Path $Csv -Leaf))
+
+@"
+.venv/
+__pycache__/
+*.pyc
+db/*.sqlite
+db/*.sqlite-*
+"@ | Set-Content -Encoding ascii .gitignore
+```
+
+Notas de Windows:
+
+- Cierra Excel y DB Browser antes de `load` o `verify`; Windows bloquea los
+  archivos abiertos.
+- Usa una ruta corta y fuera de OneDrive, por ejemplo `C:\datos\ventas_enero`.
+- No necesitas el comando `sqlite3`; usa `tabular.py query` y `tabular.py schema`.
+- Para verificar el hash usa `Get-FileHash data\raw\ventas_enero.csv -Algorithm SHA256`.
+- Si el proyecto está en WSL, instala la skill en el home de Linux y evita
+  `/mnt/c` para `.venv` y la base de datos.
 
 ### 2. Perfilar el CSV
 
@@ -131,8 +188,10 @@ decide, aplica y deja el supuesto escrito en `reports/ANALISIS.md`.
 ### 4. Escribir el mapping
 
 Lee `~/.agents/skills/tabular/references/data-guide.md` antes de escribir el
-mapping. El archivo `schema/mapping.json` declara el grano, las tablas, las
-columnas, los tipos, las claves y las relaciones. Ejemplo para ventas:
+mapping. En Windows es
+`%USERPROFILE%\.agents\skills\tabular\references\data-guide.md`. El archivo
+`schema/mapping.json` declara el grano, las tablas, las columnas, los tipos,
+las claves y las relaciones. Ejemplo para ventas:
 
 ```json
 {
@@ -369,7 +428,8 @@ ejemplo. No dupliques lógica: si la consulta crece, muévela a una vista SQL.
 
 ## Referencia
 
-Lee `~/.agents/skills/tabular/references/data-guide.md` para:
+Lee `~/.agents/skills/tabular/references/data-guide.md` (en Windows,
+`%USERPROFILE%\.agents\skills\tabular\references\data-guide.md`) para:
 
 - trampas específicas de CSV;
 - especificación completa de `mapping.json`;

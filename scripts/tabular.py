@@ -29,11 +29,10 @@ from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
 
 import pandas as pd
 
-VERSION = "0.1.0"
+VERSION = "0.2.0-rc1"
 csv.field_size_limit(10 * 1024 * 1024)
 
 DEFAULT_NULLS = ["", "na", "n/a", "null", "none", "-", "--", "sin dato", "s/d"]
@@ -73,6 +72,46 @@ def eprint(*args: Any) -> None:
     print(*args, file=sys.stderr)
 
 
+def configure_console() -> None:
+    """Evita UnicodeEncodeError en consolas Windows con code page antigua."""
+    for stream in (sys.stdout, sys.stderr):
+        if stream is None or not hasattr(stream, "reconfigure"):
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
+def ensure_sqlite_supported() -> None:
+    if sqlite3.sqlite_version_info < (3, 37, 0):
+        raise TabularError(
+            f"SQLite {sqlite3.sqlite_version} es demasiado antiguo. "
+            "Se requiere SQLite 3.37 o superior para las tablas STRICT. "
+            "Actualiza Python o usa una versión de Python que incluya un SQLite reciente."
+        )
+
+
+def replace_with_retry(
+    source: Path, target: Path, attempts: int = 5, delay: float = 0.5
+) -> None:
+    """En Windows un antivirus o una app abierta puede bloquear os.replace."""
+    last_error: PermissionError | None = None
+    for attempt in range(attempts):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError as exc:
+            last_error = exc
+            if attempt < attempts - 1:
+                time.sleep(delay)
+    raise TabularError(
+        "No se pudo reemplazar la base de datos. "
+        "Cierra Excel, DB Browser o cualquier programa que tenga abierto el archivo "
+        f"{target.name} y vuelve a intentarlo."
+    ) from last_error
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -105,7 +144,7 @@ def format_value(value: Any, max_width: int = 60) -> str:
     else:
         text = str(value).replace("\n", "\\n").replace("\r", "").replace("|", "\\|")
     if len(text) > max_width:
-        text = text[: max_width - 1] + "…"
+        text = text[:max_width] if max_width <= 3 else text[: max_width - 3] + "..."
     return text
 
 
@@ -196,7 +235,7 @@ def resolve_db(db_arg: str | None, root: Path | None = None) -> Path:
 def connect_readonly(db_path: Path) -> sqlite3.Connection:
     if not db_path.exists():
         raise TabularError(f"No existe la base: {db_path}")
-    uri = f"file:{quote(db_path.resolve().as_posix(), safe='/')}?mode=ro"
+    uri = db_path.resolve().as_uri() + "?mode=ro"
     try:
         conn = sqlite3.connect(uri, uri=True)
     except sqlite3.Error as exc:
@@ -1660,7 +1699,7 @@ def summary_markdown(
     prepared: dict[str, Any], checks: list[dict[str, Any]], mode: str, db_path: Path | None
 ) -> str:
     lines = [
-        "# Carga CSV → SQLite",
+        "# Carga CSV -> SQLite",
         "",
         f"- Modo: **{mode}**",
         f"- Fuente: `{prepared['source_path']}`",
@@ -1715,7 +1754,7 @@ def summary_markdown(
             )
         )
         if len(prepared["rejects"]) > 20:
-            lines.append(f"\n… y {len(prepared['rejects']) - 20} rechazos más.")
+            lines.append(f"\n... y {len(prepared['rejects']) - 20} rechazos más.")
         lines.append("\nDetalle completo en `reports/rechazos.csv`.")
     if checks:
         lines.extend(["", "## Verificación", ""])
@@ -1816,7 +1855,7 @@ def cmd_load(args: argparse.Namespace) -> int:
                     "La verificación falló: "
                     + "; ".join(f"{item['name']} ({item['detail']})" for item in failed)
                 )
-        os.replace(temp_path, db_path)
+        replace_with_retry(temp_path, db_path)
         for suffix in ("-wal", "-shm"):
             for base in (temp_path, db_path):
                 candidate = Path(str(base) + suffix)
@@ -2121,7 +2160,7 @@ def cmd_schema(args: argparse.Namespace) -> int:
             print("**Relaciones:**")
             for fk in item["foreign_keys"]:
                 print(
-                    f"- `{fk['from']}` → `{fk['table']}.{fk['to']}`"
+                    f"- `{fk['from']}` -> `{fk['table']}.{fk['to']}`"
                 )
     print()
     print("## DDL")
@@ -2195,9 +2234,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_console()
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.command in {"load", "verify", "query", "schema"}:
+            ensure_sqlite_supported()
         return int(args.func(args))
     except TabularError as exc:
         eprint(f"Error: {exc}")

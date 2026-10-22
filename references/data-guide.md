@@ -515,6 +515,24 @@ uv run python scripts/tabular.py query --file sql/queries/ventas_mes.sql
 
 ---
 
+## Windows
+
+- `uv`, Python, pandas y SQLite funcionan nativamente; no necesitas Visual
+  Studio Build Tools ni el CLI de SQLite.
+- Los CSV con CRLF y `cp1252` se leen sin problema; el perfilado detecta el
+  encoding.
+- Cierra Excel, DB Browser o cualquier programa que tenga abierto el CSV o la
+  base antes de cargar. Windows bloquea esos archivos y `os.replace` puede
+  fallar.
+- Evita OneDrive para el proyecto: la sincronización puede bloquear `.venv`,
+  la base y los archivos temporales.
+- Usa una ruta corta (`C:\datos\ventas_enero`) si el proyecto está en una
+  carpeta profunda; Windows tiene límite de longitud de ruta.
+- En PowerShell no uses `sqlite3`; usa `tabular.py query` y `tabular.py schema`.
+- Para el hash usa `Get-FileHash archivo.csv -Algorithm SHA256`.
+- Si usas WSL, instala la skill en el home de Linux y evita `/mnt/c` para el
+  entorno virtual y la base.
+
 ## Límites prácticos
 
 Esta versión lee el CSV completo en memoria para perfilar y cargar. Para
