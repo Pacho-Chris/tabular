@@ -2779,6 +2779,8 @@ def cmd_mutate(args: argparse.Namespace) -> int:
         warnings.append("UPDATE/DELETE sin WHERE: afecta toda la tabla.")
     if destructive:
         warnings.append("DDL destructivo: requiere --allow-destructive y backup.")
+    elif schema_change:
+        warnings.append("DDL: se hará backup y snapshot del esquema al confirmar.")
     if complex_change:
         warnings.append("Sentencia compleja: no hay undo automático.")
     if not reversible and not schema_change:
