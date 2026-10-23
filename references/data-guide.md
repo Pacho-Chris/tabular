@@ -2,12 +2,40 @@
 
 Contenido:
 
-1. [Trampas de CSV](#trampas-de-csv)
-2. [Reglas de tipos](#reglas-de-tipos)
-3. [Especificación de mapping.json](#especificación-de-mappingjson)
-4. [Criterios de normalización](#criterios-de-normalización)
-5. [Consultas y vistas](#consultas-y-vistas)
-6. [Errores frecuentes](#errores-frecuentes)
+1. [Ciclo de vida](#ciclo-de-vida)
+2. [Trampas de CSV](#trampas-de-csv)
+3. [Reglas de tipos](#reglas-de-tipos)
+4. [Especificación de mapping.json](#especificación-de-mappingjson)
+5. [Mapping y esquema real](#mapping-y-esquema-real)
+6. [Criterios de normalización](#criterios-de-normalización)
+7. [Consultas y vistas](#consultas-y-vistas)
+8. [Errores frecuentes](#errores-frecuentes)
+
+---
+
+## Ciclo de vida
+
+```text
+CSV → profile → mapping → init → base SQLite
+                                  ├── query
+                                  ├── mutate
+                                  ├── schema
+                                  ├── verify --integrity
+                                  └── history
+```
+
+- `init` se ejecuta una sola vez. Verifica el CSV, lo archiva y crea la base.
+- Después de `init`, **la base es la fuente de verdad**.
+- `mutate` es el único punto de escritura. Por defecto hace rollback; con
+  `--confirm` aplica.
+- `query` es solo lectura.
+- `schema` muestra la base real; `schema --write` regenera `schema.sql`.
+- `verify --integrity` revisa FKs, integridad y metadatos.
+- `history` muestra `_changes`, undo y backups.
+
+El CSV no se vuelve a importar para actualizar el proyecto. Los cambios se
+hacen con `mutate`. Si en el futuro se necesita una actualización masiva desde
+otro CSV, es un flujo nuevo, no parte de esta versión.
 
 ---
 
@@ -228,11 +256,14 @@ Reglas adicionales:
 
 | Campo | Obligatorio | Descripción |
 |---|---|---|
-| `path` | Sí | Ruta al CSV, relativa al proyecto o absoluta |
+| `path` | Sí | CSV inicial, relativo al proyecto o absoluto. `init --csv` puede reemplazarlo |
 | `encoding` | No | Si falta, se detecta |
 | `delimiter` | No | Si falta, se detecta |
 | `header_row` | No | Fila lógica del encabezado, 1-based. Default: 1 |
 | `footer_rows` | No | Filas finales a excluir. Default: 0 |
+
+`source.path` se usa solo en `init`. Después de importar, el CSV archivado queda
+en `data/imports/` y la base es la fuente de verdad.
 
 ### `locale`
 
@@ -252,7 +283,7 @@ Cada tabla tiene:
 {
   "name": "ventas",
   "kind": "fact",
-  "key": ["fecha", "producto_id", "cantidad", "total_centavos"],
+  "key": [],
   "columns": [
     {"name": "fecha", "source": "Fecha", "type": "DATE", "required": true}
   ]
@@ -263,12 +294,14 @@ Cada tabla tiene:
 |---|---|---|
 | `name` | Sí | snake_case ASCII, único |
 | `kind` | Sí | `dimension` o `fact` |
-| `key` | Dimensión: sí. Hechos: no | Clave natural o de negocio |
+| `key` | Dimensión: sí. Hechos: no | Clave natural/única de la tabla |
 | `columns` | Sí | Al menos una columna |
 
-`key` en una tabla de hechos es opcional. Si la declaras, se agrega una
-restricción `UNIQUE` y se evitan duplicados exactos; un duplicado con valores
-distintos se rechaza.
+`key` en una tabla de hechos es opcional y solo debe declararse si existe una
+combinación realmente única (por ejemplo `ticket_id + linea`). No uses las
+medidas (`cantidad`, `total`) como clave: dos ventas legítimas podrían coincidir
+y una de ellas se rechazaría. Si la declaras, se agrega `UNIQUE` y los
+duplicados exactos se omiten; los conflictos se rechazan.
 
 ### Columnas
 
@@ -299,13 +332,13 @@ Una FK apunta a la **clave natural** de una dimensión, no a su `id`:
  "references": "productos.sku"}
 ```
 
-El loader busca el `id` de `productos` cuyo `sku` coincide. Si no existe,
+El importador busca el `id` de `productos` cuyo `sku` coincide. Si no existe,
 rechaza la fila. La dimensión referenciada debe tener una clave de una sola
 columna; si es compuesta, no se puede usar como destino de FK en esta versión.
 
 ### Orden de tablas
 
-No importa el orden en el JSON. El loader procesa dimensiones primero,
+No importa el orden en el JSON. El importador procesa dimensiones primero,
 resolviendo dependencias, y luego hechos. No se permiten ciclos ni FKs entre
 hechos.
 
@@ -357,6 +390,28 @@ hechos.
 
 ---
 
+## Mapping y esquema real
+
+`mapping.json` es el modelo semántico que se usa en `init`: grano, tablas,
+columnas, tipos y FKs.
+
+`schema/schema.sql` es la estructura real de la base. Al principio coinciden,
+pero después de un DDL con `mutate` pueden diferir.
+
+Después de cambiar la estructura:
+
+```bash
+uv run python scripts/tabular.py schema --check
+uv run python scripts/tabular.py schema --write
+uv run python scripts/tabular.py verify --integrity
+```
+
+- `schema --check` compara mapping contra la base y muestra tablas/columnas
+  faltantes, extra o con tipo distinto.
+- `schema --write` regenera `schema.sql` desde la base.
+- Si `--check` falla, actualiza `mapping.json` o documenta la diferencia.
+- No asumas que el mapping sigue siendo la verdad después de un DDL.
+
 ## Criterios de normalización
 
 ### Primero define el grano
@@ -404,15 +459,20 @@ Sobre-normalizar complica las consultas sin mejorar la calidad.
 - Se agrega un `id INTEGER PRIMARY KEY` interno.
 - La clave natural lleva `UNIQUE` y `NOT NULL`.
 - Los hechos referencian el `id` de la dimensión.
+- En CRUD puedes usar el `id` o la clave natural, pero el `id` es el
+  identificador estable de la fila.
 - No uses el nombre visible como FK si puede cambiar; usa un código estable.
 
 ### Duplicados
 
+- La deduplicación ocurre en `init`.
 - Dimensiones: el mismo key con los mismos valores se ignora; con valores
   distintos es un conflicto y se rechaza.
 - Hechos: si declaras `key`, los duplicados exactos se omiten; los conflictos
   se rechazan. Si no declaras `key`, se cargan todas las filas.
-- Todo rechazo queda en `reports/rechazos.csv`.
+- Después de `init`, los cambios se hacen con `mutate`; no hay una segunda
+  importación que vuelva a deduplicar.
+- Todo rechazo de `init` queda en `reports/rechazos.csv`.
 
 ### Dinero
 
@@ -493,8 +553,15 @@ JOIN productos AS p ON p.id = v.producto_id
 JOIN categorias AS c ON c.id = p.categoria_id;
 ```
 
-`load` aplica todas las vistas de `sql/views/*.sql` después de cargar. Si una
-vista falla, la carga se aborta.
+`init` aplica todas las vistas de `sql/views/*.sql` después de importar. Si una
+vista falla, la importación se aborta.
+
+Después de `init`, la base es la fuente de verdad. Para crear o cambiar una
+vista usa `mutate` (por ejemplo `DROP VIEW` + `CREATE VIEW`), y luego:
+
+```bash
+uv run python scripts/tabular.py schema --write
+```
 
 ### Consultas guardadas
 
@@ -517,28 +584,17 @@ uv run python scripts/tabular.py query --file sql/queries/ventas_mes.sql
 
 ## Windows
 
-- `uv`, Python, pandas y SQLite funcionan nativamente; no necesitas Visual
-  Studio Build Tools ni el CLI de SQLite.
-- Los CSV con CRLF y `cp1252` se leen sin problema; el perfilado detecta el
-  encoding.
-- Cierra Excel, DB Browser o cualquier programa que tenga abierto el CSV o la
-  base antes de cargar. Windows bloquea esos archivos y `os.replace` puede
-  fallar.
-- Evita OneDrive para el proyecto: la sincronización puede bloquear `.venv`,
-  la base y los archivos temporales.
-- Usa una ruta corta (`C:\datos\ventas_enero`) si el proyecto está en una
-  carpeta profunda; Windows tiene límite de longitud de ruta.
-- En PowerShell no uses `sqlite3`; usa `tabular.py query` y `tabular.py schema`.
-- Para el hash usa `Get-FileHash archivo.csv -Algorithm SHA256`.
-- Si usas WSL, instala la skill en el home de Linux y evita `/mnt/c` para el
-  entorno virtual y la base.
+La instalación, el scaffolding PowerShell y las notas de archivos bloqueados,
+OneDrive, rutas largas y WSL están en `setup.md`.
 
 ## Límites prácticos
 
-Esta versión lee el CSV completo en memoria para perfilar y cargar. Para
+Esta versión lee el CSV completo en memoria para perfilar e importar. Para
 archivos de más de ~1 GB o decenas de millones de filas, avisa al usuario y
-divide el archivo por período antes de usar la skill; SQLite puede con los
-datos, pero el proceso de lectura se vuelve pesado.
+divide el archivo antes de usar la skill.
+
+Después de `init`, el crecimiento normal es por `mutate`; los backups completos
+solo se hacen para DDL, operaciones destructivas o cuando se pide `--backup`.
 
 ## Errores frecuentes
 
@@ -552,5 +608,9 @@ datos, pero el proceso de lectura se vuelve pesado.
 | Fechas invertidas | Formato `mm/dd` vs `dd/mm` | Preguntar y ajustar `locale.date` |
 | FKs huérfanas | Dimensión no cargada o clave con espacios | Revisar claves y `rechazos.csv` |
 | Totales inflados | Fila `TOTAL` incluida | Declarar `footer_rows` |
-| `UNIQUE constraint failed` | Clave de negocio duplicada | Revisar duplicados y decidir |
-| `verify` falla | Carga incompleta o mapping incorrecto | No entregar; corregir y repetir |
+| `UNIQUE constraint failed` | Clave duplicada en `init` | Revisar duplicados y decidir |
+| `Ya existe una base` | Se intentó `init` dos veces | Usar `mutate` o `init --force` |
+| `schema --check` falla | DDL sin actualizar mapping | Actualizar `mapping.json` o `schema.sql` |
+| `mutate` pide `--confirm-delete` | `DELETE` sin confirmación extra | Mostrar filas y confirmar |
+| `mutate` pide `--allow-irreversible` | Sin undo ni backup | Hacer `--backup` o cancelar |
+| `verify --integrity` falla | FK, metadata o corrupción | No entregar; revisar y restaurar backup |

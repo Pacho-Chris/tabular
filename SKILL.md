@@ -1,33 +1,33 @@
 ---
 name: tabular
 description: >
-  Limpieza, normalización y consulta de datos CSV con uv, pandas y SQLite.
-  Convierte un CSV desordenado en un proyecto reproducible con base de datos
-  normalizada, consultas SQL y funciones persistentes. Úsala siempre que el
-  usuario comparta un CSV, pida limpiar o normalizar datos, migrar un reporte
-  a una base de datos, responder preguntas como "producto más vendido" o
-  "ventas por mes", o crear herramientas de consulta reutilizables, aunque no
-  mencione pandas, SQLite ni normalización. Trabaja exclusivamente con CSV:
-  si el usuario trae XLSX o XLS, pídele exportarlo a CSV UTF-8; no proceses
-  hojas de cálculo. No usar para editar formato de Excel, PDFs, scraping ni
-  dashboards.
+  Limpieza, normalización y gestión de datos CSV con uv, pandas y SQLite.
+  Importa un CSV una sola vez, archiva la fuente y convierte la base SQLite en
+  la fuente de verdad para consultar y mutar con CRUD y DDL controlado. Úsala
+  siempre que el usuario comparta un CSV, pida limpiar o normalizar datos,
+  crear una base, consultar, actualizar o eliminar registros, agregar columnas,
+  o crear funciones de consulta reutilizables, aunque no mencione pandas,
+  SQLite ni normalización. Trabaja exclusivamente con CSV: si el usuario trae
+  XLSX o XLS, pídele exportarlo a CSV UTF-8; no proceses hojas de cálculo. No
+  usar para editar formato de Excel, PDFs, scraping ni dashboards.
 license: MIT
 compatibility: Requiere uv, Python 3.12+ y SQLite. Solo entrada CSV. Funciona en Windows, macOS y Linux.
 metadata:
-  version: "0.2.0-rc1"
+  version: "0.3.0-rc1"
   opencode/slash: "true"
 ---
 
 # tabular
 
-Convierte un CSV en un proyecto de datos reproducible: CSV inmutable, base
-SQLite normalizada, consultas SQL y funciones reutilizables. La IA analiza,
-decide y explica; `scripts/tabular.py` ejecuta la transformación sin improvisar.
+El CSV es la semilla. Después de `init`, **la base SQLite es la fuente de
+verdad** y el proyecto se trabaja con consultas, CRUD y cambios de estructura
+controlados.
+
+La IA decide y explica; `scripts/tabular.py` ejecuta, valida y deja historial.
 
 ## Entrada válida: solo CSV
 
-Acepta únicamente archivos `.csv`. Si el usuario adjunta `.xlsx`, `.xls` o
-cualquier hoja de cálculo:
+Acepta únicamente archivos `.csv`. Si el usuario adjunta `.xlsx` o `.xls`:
 
 1. No lo abras.
 2. No instales `openpyxl` ni conviertas con LibreOffice.
@@ -37,121 +37,42 @@ cualquier hoja de cálculo:
 
 `tabular.py` también rechaza cualquier archivo que no termine en `.csv`.
 
-## Requisitos
-
-- `uv` instalado y disponible en el PATH.
-- Python 3.12 gestionado por uv; no hace falta instalarlo a mano.
-- `pandas` en el entorno del proyecto (`uv add pandas`).
-- SQLite viene incluido en Python; no instales el CLI.
-- Windows: instala uv con `winget install --id=astral-sh.uv -e` o con
-  `powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"`,
-  y reinicia la terminal.
-
 ## Principios
 
-1. **El CSV original es inmutable.** Se copia a `data/raw/` y se registra su
-   SHA-256. Nunca se edita el archivo que subió el usuario.
-2. **Primero se perfila, luego se transforma.** No escribas pandas ad hoc para
-   “ver qué trae”. Usa `profile`.
-3. **Primero el grano, luego el esquema.** Define qué representa una fila antes
-   de crear tablas.
-4. **SQLite es la fuente de verdad para consultar.** pandas solo se usa para
-   leer y transformar; las respuestas salen de SQL.
-5. **Nada se descarta en silencio.** Toda fila o valor rechazado queda en
-   `reports/rechazos.csv` y se explica en el reporte.
-6. **No se responde una cifra sin ejecutarla.** Toda respuesta numérica debe
-   venir de `tabular.py query` o de una función persistente.
-7. **Si `verify` falla, no se entrega.** No hay consultas ni reporte sobre una
-   base inconsistente.
+1. **El CSV se importa una sola vez.** `init` crea la base, verifica, archiva
+   el CSV y registra su SHA-256 en `_imports`.
+2. **Después, la base manda.** No se reconstruye desde el CSV en cada consulta.
+3. **Todo cambio de datos pasa por `mutate`.** `query` es solo lectura.
+4. **Nada se aplica sin confirmación.** `mutate` hace rollback por defecto;
+   solo con `--confirm` aplica.
+5. **`DELETE` pide confirmación extra.** Usa `--confirm-delete`; si no hay
+   undo, exige `--allow-irreversible` o `--backup`.
+6. **DDL destructivo pide confirmación extra.** `DROP`/`RENAME` requiere
+   `--allow-destructive` además de `--confirm`.
+7. **Todo cambio deja historial.** `_changes`, `reports/changes/`, backups y
+   snapshots de esquema.
+8. **Si `verify --integrity` falla, no se entrega.**
+9. **El mapping ayuda al agente, pero después de un DDL puede quedar viejo.**
+   Usa `schema --check` y `schema --write`.
 
-## Flujo obligatorio
+## Flujo
 
-### 0. Identificar el CSV y el proyecto
+### 0. Identificar CSV y proyecto
 
-Confirma la ruta del CSV y deriva un nombre de proyecto en snake_case:
-`ventas_enero.csv` → `ventas_enero`. Si el nombre no es obvio, pregunta.
+Deriva un nombre snake_case: `ventas_enero.csv` → `ventas_enero`. Un proyecto
+corresponde a un CSV inicial. Si hay varios, crea un proyecto por archivo.
 
-Un proyecto corresponde a un CSV. Si el usuario entrega varios, crea un
-proyecto por archivo y no los mezcles sin una instrucción explícita.
+### 1. Preparar el proyecto
 
-Si el archivo no es `.csv`, aplica la regla de entrada y detente.
+Sigue `references/setup.md` para instalar uv, crear el proyecto, copiar
+`tabular.py`, crear carpetas y configurar `.gitignore`. En Windows usa el
+bloque PowerShell de ese archivo.
 
-### 1. Crear el proyecto con uv
-
-Elige el bloque según tu shell. Los comandos `uv run python ...` posteriores
-son idénticos en todos los sistemas.
-
-#### Linux, macOS o Git Bash
-
-Ejecuta desde el directorio donde quieras crear el proyecto:
+Los comandos posteriores son iguales en todos los sistemas:
 
 ```bash
-SKILL_DIR="$HOME/.agents/skills/tabular"
-PROJECT="ventas_enero"
-CSV="/ruta/al/ventas_enero.csv"
-
-uv init --bare --python 3.12 --name "$PROJECT" "$PROJECT"
-cd "$PROJECT"
-uv python pin 3.12
-uv add pandas
-
-mkdir -p data/raw db schema sql/views sql/queries functions reports scripts
-cp "$SKILL_DIR/scripts/tabular.py" scripts/tabular.py
-cp "$CSV" "data/raw/$(basename "$CSV")"
-
-cat > .gitignore <<'EOF'
-.venv/
-__pycache__/
-*.pyc
-db/*.sqlite
-db/*.sqlite-*
-EOF
+uv run python scripts/tabular.py ...
 ```
-
-No sobrescribas un proyecto existente. Si la carpeta ya existe, pregunta si
-continuar, usar otro nombre o actualizar el proyecto.
-
-#### Windows (PowerShell)
-
-Si la skill está instalada en `.config\opencode\skills`, ajusta `$SkillDir`.
-No uses `mkdir -p`, `cp` ni here-documents de Bash.
-
-```powershell
-$SkillDir = Join-Path $env:USERPROFILE ".agents\skills\tabular"
-$Project  = "ventas_enero"
-$Csv      = "C:\datos\ventas_enero.csv"
-
-uv init --bare --python 3.12 --name $Project $Project
-Set-Location $Project
-uv python pin 3.12
-uv add pandas
-
-$dirs = @("data\raw", "db", "schema", "sql\views", "sql\queries", "functions", "reports", "scripts")
-foreach ($dir in $dirs) {
-    New-Item -ItemType Directory -Force -Path $dir | Out-Null
-}
-
-Copy-Item (Join-Path $SkillDir "scripts\tabular.py") "scripts\tabular.py"
-Copy-Item $Csv (Join-Path "data\raw" (Split-Path $Csv -Leaf))
-
-@"
-.venv/
-__pycache__/
-*.pyc
-db/*.sqlite
-db/*.sqlite-*
-"@ | Set-Content -Encoding ascii .gitignore
-```
-
-Notas de Windows:
-
-- Cierra Excel y DB Browser antes de `load` o `verify`; Windows bloquea los
-  archivos abiertos.
-- Usa una ruta corta y fuera de OneDrive, por ejemplo `C:\datos\ventas_enero`.
-- No necesitas el comando `sqlite3`; usa `tabular.py query` y `tabular.py schema`.
-- Para verificar el hash usa `Get-FileHash data\raw\ventas_enero.csv -Algorithm SHA256`.
-- Si el proyecto está en WSL, instala la skill en el home de Linux y evita
-  `/mnt/c` para `.venv` y la base de datos.
 
 ### 2. Perfilar el CSV
 
@@ -159,280 +80,185 @@ Notas de Windows:
 uv run python scripts/tabular.py profile data/raw/ventas_enero.csv
 ```
 
-Genera `schema/profile.json` y muestra un resumen. Revisa:
+Genera `schema/profile.json`. Revisa encoding, delimitador, encabezado,
+duplicados, nulos, tipos, footer y candidatos a clave/dimensión.
 
-- encoding y delimitador detectados;
-- fila de encabezado detectada;
-- filas duplicadas, vacías y candidatas a totales;
-- columnas con ceros iniciales, fechas ambiguas, montos con coma decimal;
-- candidatos a clave y a dimensión;
-- columnas con nulos disfrazados (`N/A`, `-`, `NULL`, vacío).
-
-Si el perfil se equivocó de encabezado o delimitador, vuelve a ejecutar con
+Si el perfil se equivocó de encabezado o delimitador, repite con
 `--header-row`, `--delimiter` o `--encoding`. No edites el CSV.
 
-### 3. Interpretar y preguntar solo lo necesario
+### 3. Interpretar y escribir el mapping
 
-Avanza automáticamente y documenta supuestos, salvo que encuentres:
+Lee `references/data-guide.md` para la especificación completa. El mapping
+declara grano, tablas, dimensiones, hechos, claves, tipos y FKs.
 
-- grano ambiguo (¿una fila es una venta o un resumen?);
-- fechas ambiguas (`03/04/2026` con día y mes ≤ 12);
-- una clave candidata con duplicados y valores contradictorios;
-- filas de totales mezcladas con datos;
-- moneda o separador decimal imposible de interpretar;
-- encabezados duplicados o vacíos que impidan mapear.
+Reglas rápidas:
 
-En esos casos, pregunta al humano con datos concretos. En todo lo demás,
-decide, aplica y deja el supuesto escrito en `reports/ANALISIS.md`.
-
-### 4. Escribir el mapping
-
-Lee `~/.agents/skills/tabular/references/data-guide.md` antes de escribir el
-mapping. En Windows es
-`%USERPROFILE%\.agents\skills\tabular\references\data-guide.md`. El archivo
-`schema/mapping.json` declara el grano, las tablas, las columnas, los tipos,
-las claves y las relaciones. Ejemplo para ventas:
-
-```json
-{
-  "source": {
-    "path": "data/raw/ventas_enero.csv",
-    "header_row": 1,
-    "footer_rows": 0
-  },
-  "locale": {
-    "decimal": ",",
-    "thousands": ".",
-    "date": "dd/mm/yyyy"
-  },
-  "tables": [
-    {
-      "name": "categorias",
-      "kind": "dimension",
-      "key": ["nombre"],
-      "columns": [
-        {"name": "nombre", "source": "Categoría", "type": "TEXT", "required": true}
-      ]
-    },
-    {
-      "name": "productos",
-      "kind": "dimension",
-      "key": ["sku"],
-      "columns": [
-        {"name": "sku", "source": "SKU", "type": "TEXT", "required": true},
-        {"name": "nombre", "source": "Producto", "type": "TEXT", "required": true},
-        {"name": "categoria_id", "source": "Categoría", "type": "FK",
-         "references": "categorias.nombre"}
-      ]
-    },
-    {
-      "name": "ventas",
-      "kind": "fact",
-      "columns": [
-        {"name": "fecha", "source": "Fecha", "type": "DATE", "required": true},
-        {"name": "producto_id", "source": "SKU", "type": "FK",
-         "references": "productos.sku"},
-        {"name": "cantidad", "source": "Cantidad", "type": "INTEGER", "required": true},
-        {"name": "total_centavos", "source": "Total", "type": "MONEY", "required": true}
-      ]
-    }
-  ]
-}
-```
-
-Reglas:
-
-- `id` se agrega automáticamente; no lo declares.
+- `id` se agrega automáticamente.
 - `kind` es `dimension` o `fact`.
-- Toda dimensión necesita `key` (clave natural, una o más columnas).
-- Las FKs se declaran como `"FK"` y `references: "tabla.columna_natural"`.
-- El dinero se declara `MONEY` y se guarda en centavos (`INTEGER`).
-- Las fechas se declaran `DATE` y se guardan como `YYYY-MM-DD`.
-- Los IDs y códigos con ceros iniciales se declaran `TEXT`.
-- Si el CSV tiene encabezados duplicados, usa `source_index` (1-based) en la
-  columna correspondiente.
+- Toda dimensión necesita `key`.
+- `MONEY` se guarda en centavos.
+- `DATE` se guarda como `YYYY-MM-DD`.
+- IDs con ceros iniciales se declaran `TEXT`.
+- Encabezados duplicados o vacíos usan `source_index` (1-based).
 
-### 5. Ensayar la carga
+Pregunta al humano solo si hay ambigüedad real: grano, fechas
+`dd/mm` vs `mm/dd`, clave con conflictos, filas de totales o moneda.
 
-```bash
-uv run python scripts/tabular.py load schema/mapping.json --dry-run
-```
-
-No reemplaza la base; solo escribe `reports/rechazos.csv` si hay rechazos.
-Revisa el resumen y ese archivo:
-
-- filas fuente, aceptadas y rechazadas;
-- filas por tabla;
-- control de totales;
-- motivo de cada rechazo.
-
-Si hay rechazos bloqueantes, corrige el mapping o pregunta al humano. Si son
-aceptables, documenta la decisión y usa `--allow-rejects` en la carga real del
-paso 6.
-
-### 6. Cargar y verificar
-
-Caso normal, sin rechazos:
+### 4. Importar una sola vez
 
 ```bash
-uv run python scripts/tabular.py load schema/mapping.json
-uv run python scripts/tabular.py verify --mapping schema/mapping.json
+uv run python scripts/tabular.py init schema/mapping.json
 ```
 
-Si aceptaste rechazos de forma explícita, usa la misma opción en ambos comandos:
+`init`:
+
+1. construye una base temporal;
+2. valida el mapping y convierte los datos;
+3. verifica conteos, totales, FKs e integridad;
+4. archiva el CSV en `data/imports/AAAA-MM-DD_nombre.csv` como solo lectura;
+5. registra `_imports` y el primer `_changes`;
+6. reemplaza la base de forma atómica;
+7. escribe `schema/schema.sql`.
+
+Si hay filas rechazadas, revisa `reports/rechazos.csv` (solo se crea si hay
+rechazos). Solo usa `--allow-rejects` tras decidir que esos rechazos son
+aceptables. `init` ya escribe `schema/schema.sql`; `schema --write` solo es
+necesario después de un DDL o de cambiar una vista.
+
+Si ya existe una base, `init` se niega. `init --force` hace backup y recrea;
+pierde los cambios e historial de la base. `--delete-source` borra el CSV
+original solo después de archivar y verificar.
+
+### 5. Reporte inicial
+
+Escribe `reports/ANALISIS.md` con la plantilla de `references/templates.md`.
+Incluye tablas, filas, decisiones, calidad, consultas de ejemplo y cómo
+reconstruir.
+
+### 6. Trabajo diario: consultas
 
 ```bash
-uv run python scripts/tabular.py load schema/mapping.json --allow-rejects
-uv run python scripts/tabular.py verify --mapping schema/mapping.json --allow-rejects
-```
-
-`load` escribe en una base temporal y solo la reemplaza si la verificación
-pasa. `verify` compara la base con el CSV: conteos, totales, FKs, claves,
-nulos y hashes de fuente/mapping.
-
-Si `verify` falla:
-
-1. no respondas consultas;
-2. no escribas el reporte final;
-3. corrige el mapping o los datos de entrada con el humano;
-4. repite dry-run, load y verify.
-
-### 7. Reporte final
-
-Escribe `reports/ANALISIS.md` con esta plantilla exacta:
-
-```markdown
-# Proyecto <nombre>
-
-## Resumen
-Qué contiene el CSV, cuántas filas y qué se construyó.
-
-## Tablas creadas
-| Tabla | Tipo | Filas | Propósito |
-|---|---|---|---|
-| categorias | dimensión | <filas> | Evita repetir el nombre de la categoría |
-| productos | dimensión | <filas> | Catálogo único por SKU |
-| ventas | hechos | <filas> | Una fila por línea de venta |
-
-## Organización
-Rutas de `data/raw`, `db`, `schema`, `sql`, `functions` y `reports`.
-
-## Decisiones y supuestos
-Encoding, delimitador, fechas, moneda, filas de totales excluidas,
-deduplicación aplicada y cualquier decisión que cambie el resultado.
-
-## Calidad de datos
-Duplicados, nulos, filas rechazadas, totales de control y problemas detectados.
-
-## Consultas de ejemplo
-Preguntas que el usuario puede hacer y el SQL o comando equivalente.
-
-## Funciones disponibles
-Nombre, archivo, propósito y ejemplo de uso.
-
-## Cómo reconstruir
-`uv run python scripts/tabular.py load schema/mapping.json`
-```
-
-Además, actualiza `README.md` con el propósito del proyecto y los comandos
-básicos.
-
-## Consultas
-
-```bash
-uv run python scripts/tabular.py query "SELECT ..." --format table
+uv run python scripts/tabular.py query "SELECT ..."
 uv run python scripts/tabular.py query --file sql/queries/ventas_mes.sql
 uv run python scripts/tabular.py schema
+uv run python scripts/tabular.py verify --integrity
 ```
 
-Reglas:
+- `query` solo permite `SELECT`, `WITH` y `EXPLAIN`.
+- Responde primero el dato, después el contexto.
+- Si la pregunta pide una cifra, ejecútala; no la calcules de memoria.
+- Para consultas frecuentes, guarda SQL en `sql/queries/`.
+- `init` aplica las vistas de `sql/views/`. Después de `init`, para crear o
+  cambiar una vista usa `mutate` y luego `schema --write`.
 
-- Solo `SELECT`, `WITH` y `EXPLAIN`; el CLI abre la base en modo lectura.
-- Límite por defecto: 200 filas. Si truncas, dilo.
-- Responde primero el dato, luego el contexto. Ejemplo: “El producto más
-  vendido fue Laptop Pro, con 8 unidades.”
-- Si la pregunta exige una cifra, ejecútala. No la calcules “de memoria” ni
-  leyendo el CSV.
-- Para preguntas complejas, crea una vista en `sql/views/*.sql` y vuelve a
-  ejecutar `load` para aplicarla. Las vistas quedan versionadas.
-- Guarda consultas reutilizables en `sql/queries/*.sql`.
+### 7. CRUD y mutaciones
 
-## Funciones persistentes
-
-Cuando el usuario pida una herramienta reutilizable, crea
-`functions/func_<nombre>.py` con esta plantilla y regístrala en
-`FUNCTIONS.md`:
-
-```python
-#!/usr/bin/env python3
-"""Producto más vendido por unidades."""
-from contextlib import closing
-import json
-from pathlib import Path
-import sqlite3
-
-DB_PATH = Path(__file__).resolve().parents[1] / "db" / "ventas_enero.sqlite"
-
-
-def producto_mas_vendido(limit: int = 5) -> list[dict]:
-    sql = """
-    SELECT p.nombre AS producto, SUM(v.cantidad) AS unidades
-    FROM ventas AS v
-    JOIN productos AS p ON p.id = v.producto_id
-    GROUP BY p.id, p.nombre
-    ORDER BY unidades DESC, producto ASC
-    LIMIT :limit
-    """
-    uri = f"file:{DB_PATH}?mode=ro"
-    with closing(sqlite3.connect(uri, uri=True)) as conn:
-        conn.row_factory = sqlite3.Row
-        return [dict(row) for row in conn.execute(sql, {"limit": limit})]
-
-
-if __name__ == "__main__":
-    print(json.dumps(producto_mas_vendido(), ensure_ascii=False, indent=2))
-```
-
-Ajusta el nombre de la base y la consulta. Pruébala antes de entregar:
+`mutate` es el único punto de escritura. Por defecto hace rollback; con
+`--confirm` aplica.
 
 ```bash
-uv run python functions/func_producto_mas_vendido.py
+# simulación
+uv run python scripts/tabular.py mutate --sql "UPDATE ventas SET cantidad=3 WHERE id=42"
+
+# aplicar
+uv run python scripts/tabular.py mutate --sql "UPDATE ventas SET cantidad=3 WHERE id=42" --confirm
 ```
 
-En `FUNCTIONS.md`, agrega una fila con nombre, archivo, propósito, parámetros y
-ejemplo. No dupliques lógica: si la consulta crece, muévela a una vista SQL.
+Antes de aplicar, muestra al usuario:
+
+- qué cambia;
+- cuántas filas;
+- si hay undo;
+- si hay backup;
+- cualquier advertencia.
+
+Nunca uses `--confirm` sin un “sí” explícito del usuario. Si trabajas en un
+subagente sin humano, detente en el dry-run y no apliques; solo aplica si el
+prompt del usuario autorizó explícitamente esa mutación. El protocolo detallado
+y los flags están en `references/mutate.md`.
+
+### 8. Cambios de estructura
+
+`mutate` también acepta DDL:
+
+```bash
+uv run python scripts/tabular.py mutate --sql "ALTER TABLE ventas ADD COLUMN descuento_centavos INTEGER" --confirm
+```
+
+- Los DDL hacen backup y snapshot del esquema.
+- `DROP`/`RENAME` requieren `--allow-destructive`.
+- Después de un DDL, ejecuta `schema --check`; si hay diferencias, actualiza
+  `mapping.json` o `schema.sql`.
+
+### 9. Historial y undo
+
+```bash
+uv run python scripts/tabular.py history
+uv run python scripts/tabular.py history --show 7
+```
+
+Para revertir una operación con undo:
+
+```bash
+uv run python scripts/tabular.py mutate --file reports/changes/<timestamp>_<tipo>_undo.sql --confirm
+```
+
+`DELETE`/`INSERT` generan undo automático con `RETURNING`. `UPDATE` captura el
+antes con una consulta. Si no se puede generar undo, el script lo advierte y
+exige backup o `--allow-irreversible`.
+
+### 10. Funciones persistentes
+
+Crea `functions/func_<nombre>.py` con conexión de solo lectura y un diccionario
+`META` (nombre, descripción, parámetros con tipo/requerido). Las fechas de
+corte se reciben como argumentos; nunca uses `date('now')`.
+
+Registra la función en `FUNCTIONS.md` y pruébala antes de entregar. La
+plantilla está en `references/templates.md`.
+
+## Confirmación antes de escribir
+
+1. Ejecuta `mutate` sin `--confirm`.
+2. Muestra el resumen y las filas afectadas.
+3. Pregunta: “¿Confirmas?”. Para `DELETE`, di cuántas filas se borran y si hay
+   undo. Si no hay undo, dilo y ofrece backup o cancelar.
+4. Solo tras un “sí”, ejecuta con `--confirm` y el flag extra que corresponda.
+
+Flags:
+
+- `--confirm`: aplicar.
+- `--confirm-delete`: obligatorio para `DELETE`.
+- `--allow-irreversible`: sin undo ni backup.
+- `--allow-destructive`: `DROP`/`RENAME`.
+- `--allow-full-table`: `UPDATE`/`DELETE` sin `WHERE`.
+- `--backup`: forzar backup completo.
+- `--capture-sql`: SELECT previo para undo de `UPDATE`.
 
 ## Anti-patrones
 
-- Leer `.xlsx` o intentar convertirlo dentro de la skill.
-- Leer el CSV completo en el contexto en lugar de usar `profile`.
-- Editar `data/raw/` o “limpiar” el archivo original.
-- Crear tablas a mano con `sqlite3` fuera del mapping.
-- Cargar sin `--dry-run` y sin revisar `reports/rechazos.csv`.
-- Borrar duplicados sin declarar la clave de negocio.
-- Guardar dinero como `REAL` o porcentajes sin documentar la escala.
-- Responder con pandas en memoria en lugar de consultar SQLite.
-- Ocultar filas rechazadas o totales que no cuadran.
-- Entregar sin `verify` en verde.
+- Reconstruir la base desde el CSV después de `init`.
+- Editar el `.sqlite` con DB Browser en lugar de `mutate`.
+- Ejecutar `mutate --confirm` sin mostrar el resumen al usuario.
+- Borrar sin `--confirm-delete`.
+- Ocultar que una operación no tiene undo.
+- Asumir que `mapping.json` sigue siendo la verdad después de un DDL.
+- Usar `date('now')` en una función persistente.
+- Exportar o procesar XLSX.
 
 ## Criterio de terminado
 
 - Existe `uv.lock` y el proyecto corre con `uv run`.
 - Existen `schema/profile.json`, `schema/mapping.json` y `schema/schema.sql`.
-- La base se reconstruye desde cero con un comando.
-- `verify` pasa sin errores.
+- `init` verificó y archivó el CSV; `_imports` tiene una fila.
+- `verify --integrity` pasa.
 - `reports/ANALISIS.md` está escrito.
+- `schema --check` pasa o las diferencias están explicadas.
 - Las consultas de ejemplo funcionan.
-- El SHA-256 de `data/raw` no cambió.
-- No hay `openpyxl` ni archivos `.xlsx` en el proyecto.
+- No hay `openpyxl` ni archivos `.xlsx`.
 
-## Referencia
+## Referencias
 
-Lee `~/.agents/skills/tabular/references/data-guide.md` (en Windows,
-`%USERPROFILE%\.agents\skills\tabular\references\data-guide.md`) para:
-
-- trampas específicas de CSV;
-- especificación completa de `mapping.json`;
-- reglas de tipos, fechas, dinero y nulos;
-- criterios de normalización;
-- recetas SQL y patrones de consulta.
+- `references/setup.md`: instalación, Windows, scaffolding, backups.
+- `references/data-guide.md`: CSV, tipos, mapping, normalización, SQL.
+- `references/mutate.md`: CRUD, DDL, undo, confirmación e historial.
+- `references/templates.md`: `ANALISIS.md` y función con `META`.

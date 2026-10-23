@@ -19,7 +19,9 @@ import io
 import json
 import os
 import re
+import shutil
 import sqlite3
+import stat
 import sys
 import time
 import unicodedata
@@ -32,15 +34,18 @@ from typing import Any
 
 import pandas as pd
 
-VERSION = "0.2.0-rc1"
+VERSION = "0.3.0-rc1"
 csv.field_size_limit(10 * 1024 * 1024)
 
 DEFAULT_NULLS = ["", "na", "n/a", "null", "none", "-", "--", "sin dato", "s/d"]
 TRUE_VALUES = {"1", "si", "sí", "true", "verdadero", "yes", "y", "x"}
 FALSE_VALUES = {"0", "no", "false", "falso", "n"}
 ALLOWED_TYPES = {"TEXT", "INTEGER", "REAL", "MONEY", "DATE", "BOOLEAN", "FK"}
-RESERVED_COLUMNS = {"id", "_source_row"}
-RESERVED_TABLES = {"_ingest"}
+RESERVED_COLUMNS = {"id", "_source_row", "_row_hash", "_import_id", "_change_id"}
+RESERVED_TABLES = {"_ingest", "_imports", "_changes"}
+
+UNDO_RETENTION = 100
+BACKUP_RETENTION = 10
 
 DATE_FORMATS = [
     "%Y-%m-%d",
@@ -248,9 +253,418 @@ def connect_readonly(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-# ---------------------------------------------------------------------------
-# Lectura de CSV
-# ---------------------------------------------------------------------------
+def connect_readwrite(db_path: Path) -> sqlite3.Connection:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def ensure_database_absent(db_path: Path, force: bool) -> None:
+    if not db_path.exists():
+        return
+    if force:
+        return
+    raise TabularError(
+        f"Ya existe una base en {db_path}. La base es la fuente de verdad: "
+        "usa `mutate` para cambiarla o `init --force` para recrearla con backup."
+    )
+
+
+def relative_to_root(path: Path, root: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(root.resolve()))
+    except ValueError:
+        return str(path.resolve())
+
+
+def make_readonly(path: Path) -> None:
+    try:
+        os.chmod(path, stat.S_IREAD)
+    except OSError as exc:
+        raise TabularError(f"No se pudo marcar como solo lectura {path}: {exc}") from exc
+
+
+def archive_source(source_path: Path, root: Path, archive_dir: str) -> Path:
+    target_dir = Path(archive_dir).expanduser()
+    if not target_dir.is_absolute():
+        target_dir = root / target_dir
+    target_dir = target_dir.resolve()
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    source_path = source_path.resolve()
+    if source_path.parent == target_dir:
+        make_readonly(source_path)
+        return source_path
+
+    safe_stem = re.sub(r'[<>:"/\\|?*]+', "_", source_path.stem).strip(" .") or "import"
+    date_prefix = date.today().isoformat()
+    target = target_dir / f"{date_prefix}_{safe_stem}.csv"
+    counter = 2
+    while target.exists():
+        target = target_dir / f"{date_prefix}_{safe_stem}_{counter}.csv"
+        counter += 1
+    try:
+        shutil.copy2(source_path, target)
+    except OSError as exc:
+        raise TabularError(f"No se pudo archivar el CSV: {exc}") from exc
+    make_readonly(target)
+    return target
+
+
+def prune_backups(backup_dir: Path, keep: int) -> None:
+    if keep < 1:
+        return
+    files = sorted(
+        backup_dir.glob("*.sqlite"), key=lambda item: item.stat().st_mtime, reverse=True
+    )
+    for old in files[keep:]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
+def backup_database(
+    db_path: Path, root: Path, reason: str, keep: int = BACKUP_RETENTION
+) -> Path:
+    if not db_path.exists():
+        raise TabularError(f"No existe la base para respaldar: {db_path}")
+    backup_dir = root / "db" / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_reason = slugify(reason)
+    target = backup_dir / f"{slugify(db_path.stem)}_{timestamp}_{safe_reason}.sqlite"
+    counter = 2
+    while target.exists():
+        target = backup_dir / (
+            f"{slugify(db_path.stem)}_{timestamp}_{safe_reason}_{counter}.sqlite"
+        )
+        counter += 1
+    try:
+        with closing(sqlite3.connect(db_path)) as source, closing(
+            sqlite3.connect(target)
+        ) as destination:
+            source.backup(destination)
+        with closing(sqlite3.connect(target)) as check:
+            result = check.execute("PRAGMA integrity_check").fetchone()
+            if not result or result[0] != "ok":
+                raise TabularError(f"El backup no pasó integrity_check: {target}")
+    except Exception:
+        if target.exists():
+            try:
+                target.unlink()
+            except OSError:
+                pass
+        raise
+    prune_backups(backup_dir, keep)
+    return target
+
+
+def dump_schema_sql(conn: sqlite3.Connection) -> str:
+    rows = conn.execute(
+        "SELECT type, name, sql FROM sqlite_master "
+        "WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' "
+        "ORDER BY CASE type "
+        "WHEN 'table' THEN 0 WHEN 'index' THEN 1 WHEN 'view' THEN 2 "
+        "WHEN 'trigger' THEN 3 ELSE 4 END, name"
+    ).fetchall()
+    lines = [
+        f"-- Esquema real generado por tabular {VERSION}",
+        "-- No editar a mano: usa `schema --write` o `mutate`.",
+        "",
+        "PRAGMA foreign_keys = ON;",
+        "",
+    ]
+    for row in rows:
+        sql = (row["sql"] or "").strip()
+        if not sql:
+            continue
+        lines.append(sql.rstrip(";") + ";")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def write_schema_sql(conn: sqlite3.Connection, root: Path) -> Path:
+    path = root / "schema" / "schema.sql"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(dump_schema_sql(conn), encoding="utf-8")
+    return path
+
+
+def expected_sql_type(column_type: str) -> str:
+    return {
+        "TEXT": "TEXT",
+        "INTEGER": "INTEGER",
+        "REAL": "REAL",
+        "MONEY": "INTEGER",
+        "DATE": "TEXT",
+        "BOOLEAN": "INTEGER",
+        "FK": "INTEGER",
+    }[column_type]
+
+
+def check_mapping_drift(conn: sqlite3.Connection, mapping: dict[str, Any]) -> list[dict[str, str]]:
+    drift: list[dict[str, str]] = []
+    expected_tables: dict[str, dict[str, str]] = {}
+    for table in mapping["tables"]:
+        columns = {"id": "INTEGER"}
+        for column in table["columns"]:
+            columns[column["name"]] = expected_sql_type(column["type"])
+        if table["kind"] == "fact":
+            columns["_source_row"] = "INTEGER"
+        expected_tables[table["name"]] = columns
+
+    db_tables = {
+        row["name"]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+        if row["name"] not in {"_imports", "_changes"}
+    }
+    for table_name, expected in expected_tables.items():
+        if table_name not in db_tables:
+            drift.append(
+                {
+                    "type": "tabla_faltante",
+                    "table": table_name,
+                    "detail": "existe en mapping pero no en la base",
+                }
+            )
+            continue
+        actual = {
+            row["name"]: str(row["type"]).upper()
+            for row in conn.execute(
+                f"PRAGMA table_info({quote_ident(table_name)})"
+            ).fetchall()
+        }
+        for column_name, column_type in expected.items():
+            if column_name not in actual:
+                drift.append(
+                    {
+                        "type": "columna_faltante",
+                        "table": table_name,
+                        "detail": f"{column_name} ({column_type})",
+                    }
+                )
+            elif actual[column_name] != column_type:
+                drift.append(
+                    {
+                        "type": "tipo_distinto",
+                        "table": table_name,
+                        "detail": (
+                            f"{column_name}: mapping {column_type}, base {actual[column_name]}"
+                        ),
+                    }
+                )
+        for column_name in sorted(set(actual) - set(expected)):
+            drift.append(
+                {
+                    "type": "columna_extra",
+                    "table": table_name,
+                    "detail": column_name,
+                }
+            )
+    for table_name in sorted(db_tables - set(expected_tables)):
+        drift.append(
+            {
+                "type": "tabla_extra",
+                "table": table_name,
+                "detail": "existe en la base pero no en mapping",
+            }
+        )
+    return drift
+
+
+def strip_sql_comments(sql: str) -> str:
+    return re.sub(r"^\s*(--[^\n]*\n|/\*.*?\*/)*", "", sql, flags=re.DOTALL).strip()
+
+
+def leading_keyword(statement: str) -> str:
+    clean = strip_sql_comments(statement)
+    match = re.match(r"([A-Za-z]+)", clean)
+    return match.group(1).upper() if match else ""
+
+
+def split_sql_statements(sql: str) -> list[str]:
+    text = sql.strip()
+    if not text:
+        raise TabularError("El SQL está vacío.")
+    if not text.endswith(";"):
+        text += "\n;"
+    statements: list[str] = []
+    buffer = ""
+    for line in text.splitlines(keepends=True):
+        buffer += line
+        if sqlite3.complete_statement(buffer):
+            statement = buffer.strip()
+            if statement.strip(";").strip():
+                statements.append(statement)
+            buffer = ""
+    if buffer.strip(";").strip():
+        raise TabularError("El SQL quedó incompleto; revisa comillas y paréntesis.")
+    if not statements:
+        raise TabularError("No hay sentencias SQL para ejecutar.")
+    return statements
+
+
+def classify_statement(statement: str) -> str:
+    keyword = leading_keyword(statement)
+    upper = strip_sql_comments(statement).upper()
+    if keyword in {"SELECT", "PRAGMA", "ATTACH", "DETACH", "VACUUM", "EXPLAIN"}:
+        raise TabularError(
+            f"`{keyword}` no se permite en mutate. Usa `query` para lecturas."
+        )
+    if keyword in {"INSERT", "REPLACE"}:
+        return "data"
+    if keyword == "UPDATE":
+        return "data_full" if not re.search(r"\bWHERE\b", upper) else "data"
+    if keyword == "DELETE":
+        return "data_full" if not re.search(r"\bWHERE\b", upper) else "data_delete"
+    if keyword == "CREATE":
+        return "schema"
+    if keyword == "ALTER":
+        return "schema_destructive" if re.search(r"\b(DROP|RENAME)\b", upper) else "schema"
+    if keyword == "DROP":
+        return "schema_destructive"
+    if keyword == "WITH":
+        if re.search(r"\bDELETE\b", upper):
+            return "data_full"
+        if re.search(r"\bUPDATE\b", upper):
+            return "data_full"
+        if re.search(r"\bINSERT\b", upper):
+            return "data"
+        raise TabularError(
+            "WITH sin INSERT/UPDATE/DELETE no es una mutación. Usa `query`."
+        )
+    raise TabularError(f"Sentencia no soportada en mutate: {keyword or statement[:40]!r}")
+
+
+def table_of_statement(statement: str) -> str | None:
+    clean = strip_sql_comments(statement)
+    identifier = r'(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)'
+    patterns = [
+        rf"^\s*INSERT\s+(?:OR\s+\w+\s+)?INTO\s+({identifier})",
+        rf"^\s*REPLACE\s+INTO\s+({identifier})",
+        rf"^\s*UPDATE\s+({identifier})",
+        rf"^\s*DELETE\s+FROM\s+({identifier})",
+    ]
+    for pattern in patterns:
+        match = re.match(pattern, clean, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip('"')
+    return None
+
+
+def sql_literal(value: Any) -> str:
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, bytes):
+        return "X'" + value.hex() + "'"
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def build_update_capture_sql(statement: str) -> str | None:
+    clean = strip_sql_comments(statement).rstrip().rstrip(";")
+    identifier = r'(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)'
+    match = re.match(
+        rf"^\s*UPDATE\s+({identifier})\s+SET\s+(.+)$",
+        clean,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return None
+    table = match.group(1).strip('"')
+    rest = re.sub(r"\bRETURNING\b.*$", "", match.group(2), flags=re.IGNORECASE | re.DOTALL)
+    where_match = re.search(r"\bWHERE\b(.+)$", rest, flags=re.IGNORECASE | re.DOTALL)
+    if where_match:
+        return f"SELECT * FROM {quote_ident(table)} WHERE {where_match.group(1)}"
+    return f"SELECT * FROM {quote_ident(table)}"
+
+
+def fetch_rows(conn: sqlite3.Connection, sql: str) -> list[dict[str, Any]]:
+    clean = strip_sql_comments(sql).lstrip().upper()
+    if not clean.startswith("SELECT"):
+        raise TabularError("--capture-sql debe ser una consulta SELECT.")
+    cursor = conn.execute(sql)
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def generate_undo_sql(action: str, table: str, rows: list[dict[str, Any]]) -> str | None:
+    if not rows:
+        return f"-- Sin filas afectadas en {table}.\n"
+    columns = list(rows[0].keys())
+    quoted_columns = ", ".join(quote_ident(column) for column in columns)
+    if action == "delete":
+        values = [
+            "(" + ", ".join(sql_literal(row.get(column)) for column in columns) + ")"
+            for row in rows
+        ]
+        return (
+            f"INSERT INTO {quote_ident(table)} ({quoted_columns}) VALUES "
+            + ", ".join(values)
+            + ";\n"
+        )
+    if "id" not in columns:
+        return None
+    if action == "insert":
+        ids = [row.get("id") for row in rows]
+        if any(value is None for value in ids):
+            return None
+        return (
+            f"DELETE FROM {quote_ident(table)} WHERE "
+            + "id IN (" + ", ".join(sql_literal(value) for value in ids) + ");\n"
+        )
+    if action == "update":
+        statements = []
+        for row in rows:
+            assignments = ", ".join(
+                f"{quote_ident(column)} = {sql_literal(row.get(column))}"
+                for column in columns
+                if column != "id"
+            )
+            statements.append(
+                f"UPDATE {quote_ident(table)} SET {assignments} "
+                f"WHERE id = {sql_literal(row.get('id'))};"
+            )
+        return "\n".join(statements) + "\n"
+    return None
+
+
+def prune_undo_history(conn: sqlite3.Connection, root: Path, keep: int) -> None:
+    if keep < 1:
+        return
+    rows = conn.execute(
+        'SELECT id, undo_path FROM "_changes" '
+        "WHERE undo_path IS NOT NULL ORDER BY id DESC"
+    ).fetchall()
+    for row in rows[keep:]:
+        path = Path(row["undo_path"])
+        if not path.is_absolute():
+            path = root / path
+        if path.exists():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        conn.execute(
+            'UPDATE "_changes" SET undo_path = NULL, reversible = 0 WHERE id = ?',
+            (row["id"],),
+        )
+    conn.commit()
+
+
+def history_summary(statement: str, kind: str) -> str:
+    first_line = " ".join(strip_sql_comments(statement).split())
+    if len(first_line) > 90:
+        first_line = first_line[:87] + "..."
+    return f"{kind}: {first_line}"
 
 
 def detect_encoding(path: Path) -> str:
@@ -1221,10 +1635,14 @@ def resolve_source_columns(mapping: dict[str, Any], header: list[str]) -> None:
 
 
 def source_rows_for_load(
-    mapping: dict[str, Any], root: Path
+    mapping: dict[str, Any], root: Path, csv_override: Path | None = None
 ) -> tuple[Path, str, str, list[str], list[tuple[int, list[str]]], int]:
     source = mapping["source"]
-    path = resolve_source_path(source["path"], root)
+    if csv_override is not None:
+        path = csv_override if csv_override.is_absolute() else root / csv_override
+        path = path.resolve()
+    else:
+        path = resolve_source_path(source["path"], root)
     ensure_csv(path)
     encoding = source.get("encoding") or detect_encoding(path)
     validate_encoding(path, encoding)
@@ -1252,10 +1670,13 @@ def source_rows_for_load(
 
 
 def prepare_load(
-    mapping: dict[str, Any], root: Path, allow_rejects: bool = False
+    mapping: dict[str, Any],
+    root: Path,
+    allow_rejects: bool = False,
+    csv_override: Path | None = None,
 ) -> dict[str, Any]:
     path, encoding, delimiter, header, data, header_row = source_rows_for_load(
-        mapping, root
+        mapping, root, csv_override=csv_override
     )
     resolve_source_columns(mapping, header)
     header_width = len(header)
@@ -1460,7 +1881,7 @@ def prepare_load(
 def build_schema(mapping: dict[str, Any]) -> str:
     lines: list[str] = [
         f"-- Esquema generado por tabular {VERSION}",
-        "-- No editar a mano: se reconstruye desde schema/mapping.json",
+        "-- No editar a mano: usa `schema --write` o `mutate`.",
         "",
         "PRAGMA foreign_keys = ON;",
         "",
@@ -1507,14 +1928,33 @@ def build_schema(mapping: dict[str, Any]) -> str:
     lines.extend(
         [
             "",
-            'CREATE TABLE "_ingest" (',
+            'CREATE TABLE "_imports" (',
             '  "id" INTEGER PRIMARY KEY,',
+            '  "kind" TEXT NOT NULL,',
             '  "source_path" TEXT NOT NULL,',
+            '  "archived_path" TEXT NOT NULL,',
             '  "source_sha256" TEXT NOT NULL,',
             '  "mapping_sha256" TEXT NOT NULL,',
-            '  "loaded_at" TEXT NOT NULL,',
+            '  "imported_at" TEXT NOT NULL,',
             '  "source_rows" INTEGER NOT NULL,',
             '  "rejected_rows" INTEGER NOT NULL,',
+            '  "details_json" TEXT NOT NULL,',
+            '  "tool_version" TEXT NOT NULL',
+            ") STRICT;",
+            "",
+            'CREATE TABLE "_changes" (',
+            '  "id" INTEGER PRIMARY KEY,',
+            '  "executed_at" TEXT NOT NULL,',
+            '  "kind" TEXT NOT NULL,',
+            '  "sql_text" TEXT NOT NULL,',
+            '  "summary" TEXT NOT NULL,',
+            '  "affected_rows" INTEGER NOT NULL,',
+            '  "reversible" INTEGER NOT NULL,',
+            '  "undo_path" TEXT,',
+            '  "backup_path" TEXT,',
+            '  "schema_before" TEXT,',
+            '  "schema_after" TEXT,',
+            '  "mapping_sha256" TEXT,',
             '  "tool_version" TEXT NOT NULL',
             ") STRICT;",
         ]
@@ -1530,9 +1970,6 @@ def insert_rows(
     conn: sqlite3.Connection,
     mapping: dict[str, Any],
     prepared: dict[str, Any],
-    source_hash: str,
-    mapping_hash: str,
-    root: Path,
 ) -> None:
     conn.execute("PRAGMA foreign_keys = ON")
     for table in mapping["tables"]:
@@ -1552,23 +1989,61 @@ def insert_rows(
         values = [[row.get(name) for name in column_names] for row in rows]
         conn.executemany(sql, values)
 
-    source_path = prepared["source_path"]
-    try:
-        source_path_text = str(source_path.relative_to(root))
-    except ValueError:
-        source_path_text = str(source_path)
+
+def record_init(
+    conn: sqlite3.Connection,
+    prepared: dict[str, Any],
+    root: Path,
+    source_hash: str,
+    mapping_hash: str,
+    archived_path: Path,
+    backup_path: Path | None,
+) -> None:
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    counts = {
+        table["name"]: len(prepared["rows_by_table"][table["name"]])
+        for table in prepared["mapping"]["tables"]
+    }
+    source_text = relative_to_root(prepared["source_path"], root)
+    archived_text = relative_to_root(archived_path, root)
+    backup_text = relative_to_root(backup_path, root) if backup_path else None
     conn.execute(
-        'INSERT INTO "_ingest" '
-        '("source_path", "source_sha256", "mapping_sha256", "loaded_at", '
-        '"source_rows", "rejected_rows", "tool_version") '
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        'INSERT INTO "_imports" '
+        '("kind", "source_path", "archived_path", "source_sha256", '
+        '"mapping_sha256", "imported_at", "source_rows", "rejected_rows", '
+        '"details_json", "tool_version") '
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
-            source_path_text,
+            "init",
+            source_text,
+            archived_text,
             source_hash,
             mapping_hash,
-            datetime.now().astimezone().isoformat(timespec="seconds"),
+            now,
             prepared["source_rows"],
             prepared["rejected_rows"],
+            json.dumps(counts, ensure_ascii=False, sort_keys=True),
+            VERSION,
+        ),
+    )
+    conn.execute(
+        'INSERT INTO "_changes" '
+        '("executed_at", "kind", "sql_text", "summary", "affected_rows", '
+        '"reversible", "undo_path", "backup_path", "schema_before", '
+        '"schema_after", "mapping_sha256", "tool_version") '
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            now,
+            "init",
+            f"init {prepared['source_path'].name}",
+            f"Importación inicial de {prepared['source_path'].name}",
+            0,
+            0,
+            None,
+            backup_text,
+            None,
+            None,
+            mapping_hash,
             VERSION,
         ),
     )
@@ -1597,33 +2072,13 @@ def apply_views(conn: sqlite3.Connection, root: Path) -> list[str]:
     return applied
 
 
-def verify_connection(
+def verify_source(
     conn: sqlite3.Connection,
     mapping: dict[str, Any],
     prepared: dict[str, Any],
     allow_rejects: bool = False,
 ) -> list[dict[str, Any]]:
     checks: list[dict[str, Any]] = []
-
-    integrity = conn.execute("PRAGMA integrity_check").fetchone()
-    integrity_ok = bool(integrity and integrity[0] == "ok")
-    checks.append(
-        {
-            "name": "integrity_check",
-            "passed": integrity_ok,
-            "detail": "ok" if integrity_ok else str(integrity[0] if integrity else "sin resultado"),
-        }
-    )
-
-    fk_errors = conn.execute("PRAGMA foreign_key_check").fetchall()
-    checks.append(
-        {
-            "name": "foreign_key_check",
-            "passed": not fk_errors,
-            "detail": "0 huérfanas" if not fk_errors else f"{len(fk_errors)} huérfanas",
-        }
-    )
-
     for table in mapping["tables"]:
         table_name = table["name"]
         expected_rows = prepared["rows_by_table"][table_name]
@@ -1667,7 +2122,81 @@ def verify_connection(
                 "detail": f"{prepared['rejected_rows']} filas rechazadas",
             }
         )
+    return checks
 
+
+def verify_integrity(
+    conn: sqlite3.Connection, require_metadata: bool = True
+) -> list[dict[str, Any]]:
+    checks: list[dict[str, Any]] = []
+    integrity = conn.execute("PRAGMA integrity_check").fetchone()
+    integrity_ok = bool(integrity and integrity[0] == "ok")
+    checks.append(
+        {
+            "name": "integrity_check",
+            "passed": integrity_ok,
+            "detail": "ok" if integrity_ok else str(integrity[0] if integrity else "sin resultado"),
+        }
+    )
+
+    fk_errors = conn.execute("PRAGMA foreign_key_check").fetchall()
+    checks.append(
+        {
+            "name": "foreign_key_check",
+            "passed": not fk_errors,
+            "detail": "0 huérfanas" if not fk_errors else f"{len(fk_errors)} huérfanas",
+        }
+    )
+
+    if require_metadata:
+        for table_name in ("_imports", "_changes"):
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table_name,),
+            ).fetchone()
+            checks.append(
+                {
+                    "name": f"meta:tabla:{table_name}",
+                    "passed": bool(exists),
+                    "detail": "presente" if exists else "faltante",
+                }
+            )
+
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_imports'"
+        ).fetchone():
+            count = conn.execute('SELECT COUNT(*) FROM "_imports"').fetchone()[0]
+            checks.append(
+                {
+                    "name": "meta:registros:_imports",
+                    "passed": count >= 1,
+                    "detail": f"{count} registros",
+                }
+            )
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_changes'"
+        ).fetchone():
+            count = conn.execute('SELECT COUNT(*) FROM "_changes"').fetchone()[0]
+            checks.append(
+                {
+                    "name": "meta:registros:_changes",
+                    "passed": count >= 1,
+                    "detail": f"{count} registros",
+                }
+            )
+
+    tables = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' "
+        "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+    ).fetchall()
+    for table in tables:
+        name = table["name"]
+        count = conn.execute(
+            f"SELECT COUNT(*) FROM {quote_ident(name)}"
+        ).fetchone()[0]
+        checks.append(
+            {"name": f"tabla:{name}", "passed": True, "detail": f"{count} filas"}
+        )
     return checks
 
 
@@ -1696,10 +2225,15 @@ def write_rejects(path: Path, rejects: list[dict[str, Any]]) -> None:
 
 
 def summary_markdown(
-    prepared: dict[str, Any], checks: list[dict[str, Any]], mode: str, db_path: Path | None
+    prepared: dict[str, Any],
+    checks: list[dict[str, Any]],
+    mode: str,
+    db_path: Path | None,
+    archive_path: Path | None = None,
+    backup_path: Path | None = None,
 ) -> str:
     lines = [
-        "# Carga CSV -> SQLite",
+        "# Importación CSV -> SQLite",
         "",
         f"- Modo: **{mode}**",
         f"- Fuente: `{prepared['source_path']}`",
@@ -1710,6 +2244,10 @@ def summary_markdown(
         f"- Filas aceptadas: {prepared['accepted_rows']}",
         f"- Filas rechazadas: {prepared['rejected_rows']}",
     ]
+    if archive_path is not None:
+        lines.append(f"- CSV archivado: `{archive_path}`")
+    if backup_path is not None:
+        lines.append(f"- Backup previo: `{backup_path}`")
     if db_path is not None:
         lines.append(f"- Base: `{db_path}`")
     lines.extend(["", "## Tablas", ""])
@@ -1792,39 +2330,27 @@ def cmd_profile(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_load(args: argparse.Namespace) -> int:
+def cmd_init(args: argparse.Namespace) -> int:
     mapping_path = Path(args.mapping).expanduser().resolve()
     root = resolve_root(mapping_path)
     mapping = load_mapping(mapping_path)
     mapping_hash = sha256_file(mapping_path)
-    prepared = prepare_load(mapping, root, allow_rejects=args.allow_rejects)
+    db_path = resolve_db(args.db, root) if args.db else default_db_path(root)
+    ensure_database_absent(db_path, args.force)
+    csv_override = Path(args.csv).expanduser() if args.csv else None
+    prepared = prepare_load(
+        mapping, root, allow_rejects=args.allow_rejects, csv_override=csv_override
+    )
 
     reports_dir = root / "reports"
     reject_path = reports_dir / "rechazos.csv"
     if not args.no_report:
         write_rejects(reject_path, prepared["rejects"])
 
-    db_path = (
-        resolve_db(args.db, root) if args.db else default_db_path(root)
-    )
-    source_hash = sha256_file(prepared["source_path"])
-
-    if args.dry_run:
-        with closing(sqlite3.connect(":memory:")) as conn:
-            conn.execute("PRAGMA foreign_keys = ON")
-            apply_schema(conn, build_schema(mapping))
-            insert_rows(conn, mapping, prepared, source_hash, mapping_hash, root)
-            apply_views(conn, root)
-            checks = verify_connection(conn, mapping, prepared, args.allow_rejects)
-        print(summary_markdown(prepared, checks, "dry-run", None))
-        if prepared["rejects"] and not args.no_report:
-            print(f"\nRechazos: `{reject_path}`")
-        return 0
-
     if prepared["blocking"]:
-        print(summary_markdown(prepared, [], "load (abortado)", db_path))
+        print(summary_markdown(prepared, [], "init (abortado)", db_path))
         raise TabularError(
-            "La carga se abortó porque hay filas rechazadas. "
+            "La importación se abortó porque hay filas rechazadas. "
             "Revisa reports/rechazos.csv o usa --allow-rejects."
         )
     if prepared["accepted_rows"] == 0:
@@ -1833,6 +2359,7 @@ def cmd_load(args: argparse.Namespace) -> int:
             "Revisa reports/rechazos.csv y corrige el mapping."
         )
 
+    source_hash = sha256_file(prepared["source_path"])
     db_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = db_path.with_name(db_path.name + ".tmp")
     for suffix in ("", "-wal", "-shm"):
@@ -1840,36 +2367,66 @@ def cmd_load(args: argparse.Namespace) -> int:
         if candidate.exists():
             candidate.unlink()
 
+    archive_path: Path | None = None
+    backup_path: Path | None = None
     try:
-        with closing(sqlite3.connect(temp_path)) as conn:
-            conn.execute("PRAGMA foreign_keys = ON")
-            conn.execute("PRAGMA synchronous = NORMAL")
-            ddl = build_schema(mapping)
-            apply_schema(conn, ddl)
-            insert_rows(conn, mapping, prepared, source_hash, mapping_hash, root)
+        with closing(connect_readwrite(temp_path)) as conn:
+            apply_schema(conn, build_schema(mapping))
+            insert_rows(conn, mapping, prepared)
             apply_views(conn, root)
-            checks = verify_connection(conn, mapping, prepared, args.allow_rejects)
-            failed = [check for check in checks if not check["passed"]]
+
+            source_checks = verify_source(
+                conn, mapping, prepared, allow_rejects=args.allow_rejects
+            )
+            pre_checks = verify_integrity(conn, require_metadata=False)
+            failed = [
+                check for check in source_checks + pre_checks if not check["passed"]
+            ]
             if failed:
                 raise TabularError(
-                    "La verificación falló: "
+                    "La verificación previa falló: "
                     + "; ".join(f"{item['name']} ({item['detail']})" for item in failed)
                 )
+
+            if args.force and db_path.exists():
+                backup_path = backup_database(db_path, root, "pre-init-force")
+            archive_path = archive_source(prepared["source_path"], root, args.archive_dir)
+            if sha256_file(archive_path) != source_hash:
+                raise TabularError(
+                    "El CSV archivado no coincide con el original; no se registró la importación."
+                )
+            record_init(
+                conn,
+                prepared,
+                root,
+                source_hash,
+                mapping_hash,
+                archive_path,
+                backup_path,
+            )
+            post_checks = verify_integrity(conn, require_metadata=True)
+            failed = [check for check in post_checks if not check["passed"]]
+            if failed:
+                raise TabularError(
+                    "La verificación posterior a la importación falló: "
+                    + "; ".join(f"{item['name']} ({item['detail']})" for item in failed)
+                )
+
         replace_with_retry(temp_path, db_path)
         for suffix in ("-wal", "-shm"):
             for base in (temp_path, db_path):
                 candidate = Path(str(base) + suffix)
                 if candidate.exists():
                     candidate.unlink()
-        schema_path = root / "schema" / "schema.sql"
-        schema_path.parent.mkdir(parents=True, exist_ok=True)
-        schema_text = build_schema(mapping)
-        view_dir = root / "sql" / "views"
-        if view_dir.exists():
-            for view_path in sorted(view_dir.glob("*.sql")):
-                schema_text += "\n\n-- " + view_path.name + "\n"
-                schema_text += view_path.read_text(encoding="utf-8-sig").rstrip() + "\n"
-        schema_path.write_text(schema_text, encoding="utf-8")
+
+        with closing(connect_readonly(db_path)) as conn:
+            write_schema_sql(conn, root)
+
+        if args.delete_source and prepared["source_path"].resolve() != archive_path.resolve():
+            try:
+                prepared["source_path"].unlink()
+            except OSError as exc:
+                eprint(f"Aviso: no se pudo borrar el CSV original: {exc}")
     except Exception:
         for suffix in ("", "-wal", "-shm"):
             candidate = Path(str(temp_path) + suffix)
@@ -1880,111 +2437,30 @@ def cmd_load(args: argparse.Namespace) -> int:
                     pass
         raise
 
-    print(summary_markdown(prepared, checks, "load", db_path))
+    checks = source_checks + post_checks
+    print(
+        summary_markdown(
+            prepared,
+            checks,
+            "init",
+            db_path,
+            archive_path=archive_path,
+            backup_path=backup_path,
+        )
+    )
     return 0
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
-    mapping_path = Path(args.mapping).expanduser().resolve() if args.mapping else None
-    root = resolve_root(mapping_path) if mapping_path else Path.cwd().resolve()
-    db_path = resolve_db(args.db, root)
-
-    mapping = load_mapping(mapping_path) if mapping_path else None
-    prepared = prepare_load(mapping, root, allow_rejects=args.allow_rejects) if mapping else None
-
+    db_path = resolve_db(args.db)
     with closing(connect_readonly(db_path)) as conn:
-        if mapping and prepared:
-            checks = verify_connection(conn, mapping, prepared, args.allow_rejects)
-            # Comparar contra la última carga registrada.
-            has_ingest = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_ingest'"
-            ).fetchone()
-            row = (
-                conn.execute(
-                    'SELECT * FROM "_ingest" ORDER BY id DESC LIMIT 1'
-                ).fetchone()
-                if has_ingest
-                else None
-            )
-            row = dict(row) if row else None
-            if row:
-                checks.append(
-                    {
-                        "name": "ingest:source_rows",
-                        "passed": row["source_rows"] == prepared["source_rows"],
-                        "detail": f"registradas {row['source_rows']}, fuente {prepared['source_rows']}",
-                    }
-                )
-                checks.append(
-                    {
-                        "name": "ingest:rejected_rows",
-                        "passed": row["rejected_rows"] == prepared["rejected_rows"],
-                        "detail": f"registradas {row['rejected_rows']}, fuente {prepared['rejected_rows']}",
-                    }
-                )
-                if "source_sha256" in row:
-                    current_source_hash = sha256_file(prepared["source_path"])
-                    checks.append(
-                        {
-                            "name": "ingest:source_sha256",
-                            "passed": row["source_sha256"] == current_source_hash,
-                            "detail": (
-                                "coincide"
-                                if row["source_sha256"] == current_source_hash
-                                else "el CSV cambió desde la carga"
-                            ),
-                        }
-                    )
-                if "mapping_sha256" in row and mapping_path:
-                    current_mapping_hash = sha256_file(mapping_path)
-                    checks.append(
-                        {
-                            "name": "ingest:mapping_sha256",
-                            "passed": row["mapping_sha256"] == current_mapping_hash,
-                            "detail": (
-                                "coincide"
-                                if row["mapping_sha256"] == current_mapping_hash
-                                else "el mapping cambió desde la carga"
-                            ),
-                        }
-                    )
-        else:
-            checks = []
-            integrity = conn.execute("PRAGMA integrity_check").fetchone()
-            integrity_ok = bool(integrity and integrity[0] == "ok")
-            checks.append(
-                {
-                    "name": "integrity_check",
-                    "passed": integrity_ok,
-                    "detail": "ok" if integrity_ok else str(integrity[0] if integrity else "sin resultado"),
-                }
-            )
-            fk_errors = conn.execute("PRAGMA foreign_key_check").fetchall()
-            checks.append(
-                {
-                    "name": "foreign_key_check",
-                    "passed": not fk_errors,
-                    "detail": "0 huérfanas" if not fk_errors else f"{len(fk_errors)} huérfanas",
-                }
-            )
-            tables = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table' "
-                "AND name NOT LIKE 'sqlite_%' ORDER BY name"
-            ).fetchall()
-            for table in tables:
-                name = table["name"]
-                count = conn.execute(
-                    f"SELECT COUNT(*) FROM {quote_ident(name)}"
-                ).fetchone()[0]
-                checks.append(
-                    {"name": f"tabla:{name}", "passed": True, "detail": f"{count} filas"}
-                )
+        checks = verify_integrity(conn)
 
     failed = [check for check in checks if not check["passed"]]
     if args.format == "json":
         print(json.dumps(checks, ensure_ascii=False, indent=2))
     else:
-        print("# Verificación")
+        print("# Verificación de integridad")
         print()
         print(
             format_table(
@@ -2083,8 +2559,530 @@ def cmd_query(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_schema(args: argparse.Namespace) -> int:
+def ensure_returning(statement: str) -> str:
+    clean = statement.strip().rstrip(";").rstrip()
+    if re.search(r"\bRETURNING\b", clean, flags=re.IGNORECASE):
+        return statement
+    return clean + " RETURNING *;"
+
+
+def execute_mutation_statements(
+    conn: sqlite3.Connection,
+    statements: list[str],
+    kinds: list[str],
+    capture_sql: str | None,
+) -> dict[str, Any]:
+    schema_change = any(kind in {"schema", "schema_destructive"} for kind in kinds)
+    before_schema = dump_schema_sql(conn) if schema_change else None
+    captures: list[dict[str, Any] | None] = []
+    rowcounts: list[int] = []
+
+    for statement, kind in zip(statements, kinds):
+        keyword = leading_keyword(statement)
+        table = table_of_statement(statement)
+        capture: dict[str, Any] | None = None
+
+        if kind in {"data", "data_full", "data_delete"} and keyword == "UPDATE":
+            old_rows: list[dict[str, Any]] | None = None
+            if capture_sql:
+                old_rows = fetch_rows(conn, capture_sql)
+            else:
+                auto_capture = build_update_capture_sql(statement)
+                if auto_capture:
+                    try:
+                        old_rows = fetch_rows(conn, auto_capture)
+                    except sqlite3.Error:
+                        old_rows = None
+            cursor = conn.execute(statement)
+            if re.search(r"\bRETURNING\b", statement, flags=re.IGNORECASE):
+                count = len(cursor.fetchall())
+            else:
+                count = max(cursor.rowcount, 0)
+            if old_rows is not None and table:
+                capture = {"action": "update", "table": table, "rows": old_rows}
+        elif kind in {"data", "data_full", "data_delete"} and keyword == "DELETE":
+            rows: list[dict[str, Any]] | None = None
+            try:
+                cursor = conn.execute(ensure_returning(statement))
+                rows = [dict(row) for row in cursor.fetchall()]
+            except sqlite3.OperationalError:
+                cursor = conn.execute(statement)
+                rows = None
+            count = len(rows) if rows is not None else max(cursor.rowcount, 0)
+            if rows is not None and table:
+                capture = {"action": "delete", "table": table, "rows": rows}
+        elif kind in {"data", "data_full"} and keyword in {"INSERT", "REPLACE"}:
+            rows = None
+            upper_statement = statement.upper()
+            if (
+                keyword == "INSERT"
+                and "OR REPLACE" not in upper_statement
+                and "ON CONFLICT" not in upper_statement
+            ):
+                try:
+                    cursor = conn.execute(ensure_returning(statement))
+                    rows = [dict(row) for row in cursor.fetchall()]
+                except sqlite3.OperationalError:
+                    cursor = conn.execute(statement)
+                    rows = None
+            else:
+                cursor = conn.execute(statement)
+            count = len(rows) if rows is not None else max(cursor.rowcount, 0)
+            if rows is not None and table:
+                capture = {"action": "insert", "table": table, "rows": rows}
+        else:
+            cursor = conn.execute(statement)
+            count = max(cursor.rowcount, 0)
+
+        captures.append(capture)
+        rowcounts.append(count)
+
+    after_schema = dump_schema_sql(conn) if schema_change else None
+    return {
+        "captures": captures,
+        "rowcounts": rowcounts,
+        "before_schema": before_schema,
+        "after_schema": after_schema,
+    }
+
+
+def compute_undo(
+    statements: list[str], kinds: list[str], result: dict[str, Any]
+) -> tuple[bool, str | None]:
+    if len(statements) != 1 or kinds[0] not in {"data", "data_full", "data_delete"}:
+        return False, None
+    capture = result["captures"][0] if result["captures"] else None
+    if not capture:
+        return False, None
+    if capture["action"] == "update" and len(capture["rows"]) != result["rowcounts"][0]:
+        return False, None
+    undo = generate_undo_sql(capture["action"], capture["table"], capture["rows"])
+    if undo is None:
+        return False, None
+    return True, undo
+
+
+def unique_change_base(directory: Path, base: str) -> str:
+    candidate = base
+    counter = 2
+    while any(
+        (directory / f"{candidate}{suffix}").exists()
+        for suffix in (".sql", "_undo.sql", ".md")
+    ):
+        candidate = f"{base}_{counter}"
+        counter += 1
+    return candidate
+
+
+def mutation_summary(
+    mode: str,
+    sql_text: str,
+    kinds: list[str],
+    result: dict[str, Any],
+    reversible: bool,
+    undo_path: Path | None,
+    backup_path: Path | None,
+    warnings: list[str],
+) -> str:
+    affected = sum(result["rowcounts"])
+    lines = [
+        "# Mutación SQL",
+        "",
+        f"- Modo: **{mode}**",
+        f"- Tipo: `{', '.join(kinds)}`",
+        f"- Filas afectadas: {affected}",
+        f"- Reversible: {'sí' if reversible else 'no'}",
+    ]
+    if undo_path is not None:
+        lines.append(f"- Undo: `{undo_path}`")
+    if backup_path is not None:
+        lines.append(f"- Backup: `{backup_path}`")
+    if warnings:
+        lines.extend(["", "## Advertencias", ""])
+        lines.extend(f"- {warning}" for warning in warnings)
+    lines.extend(["", "## SQL", "", "```sql", sql_text.strip(), "```"])
+    return "\n".join(lines)
+
+
+def write_change_report(
+    path: Path,
+    mode: str,
+    sql_text: str,
+    kinds: list[str],
+    result: dict[str, Any],
+    reversible: bool,
+    undo_path: Path | None,
+    backup_path: Path | None,
+    warnings: list[str],
+) -> None:
+    path.write_text(
+        mutation_summary(
+            mode, sql_text, kinds, result, reversible, undo_path, backup_path, warnings
+        ),
+        encoding="utf-8",
+    )
+
+
+def cmd_mutate(args: argparse.Namespace) -> int:
     db_path = resolve_db(args.db)
+    root = Path.cwd().resolve()
+    if args.sql and args.file:
+        raise TabularError("Usa --sql o --file, no ambos.")
+    if not args.sql and not args.file:
+        raise TabularError("Debes indicar --sql o --file.")
+    if args.file:
+        file_path = Path(args.file).expanduser()
+        if not file_path.exists():
+            raise TabularError(f"No existe el archivo SQL: {file_path}")
+        sql_text = file_path.read_text(encoding="utf-8-sig")
+    else:
+        sql_text = args.sql
+    if args.keep_history < 1 or args.keep_backups < 1:
+        raise TabularError("--keep-history y --keep-backups deben ser mayores que cero.")
+
+    statements = split_sql_statements(sql_text)
+    kinds = [classify_statement(statement) for statement in statements]
+    if args.capture_sql and (
+        len(statements) != 1
+        or kinds[0] not in {"data", "data_full"}
+        or leading_keyword(statements[0]) != "UPDATE"
+    ):
+        raise TabularError("--capture-sql solo aplica a una única sentencia UPDATE.")
+
+    destructive = any(kind == "schema_destructive" for kind in kinds)
+    schema_change = any(kind in {"schema", "schema_destructive"} for kind in kinds)
+    delete_change = any(
+        kind == "data_delete"
+        or (
+            leading_keyword(statement) == "WITH"
+            and "DELETE" in statement.upper()
+        )
+        for statement, kind in zip(statements, kinds)
+    )
+    full_table = any(kind == "data_full" for kind in kinds)
+    complex_change = any(kind == "complex" for kind in kinds)
+
+    with closing(connect_readwrite(db_path)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            result = execute_mutation_statements(
+                conn, statements, kinds, args.capture_sql
+            )
+        finally:
+            conn.rollback()
+
+    reversible, undo_sql = compute_undo(statements, kinds, result)
+    warnings: list[str] = []
+    if delete_change:
+        warnings.append("Es un DELETE. El agente debe pedir confirmación explícita.")
+    if full_table:
+        warnings.append("UPDATE/DELETE sin WHERE: afecta toda la tabla.")
+    if destructive:
+        warnings.append("DDL destructivo: requiere --allow-destructive y backup.")
+    if complex_change:
+        warnings.append("Sentencia compleja: no hay undo automático.")
+    if not reversible and not schema_change:
+        warnings.append("No hay undo automático; usa --backup o --allow-irreversible.")
+
+    if not args.confirm:
+        undo_preview = root / "reports" / "changes" / "<se generará al confirmar>_undo.sql" if reversible else None
+        print(
+            mutation_summary(
+                "dry-run (rollback)",
+                sql_text,
+                kinds,
+                result,
+                reversible,
+                undo_preview,
+                None,
+                warnings,
+            )
+        )
+        print("\nNo se aplicó nada. Revisa las advertencias y confirma con --confirm.")
+        return 0
+
+    if delete_change and not args.confirm_delete:
+        raise TabularError(
+            "DELETE requiere confirmación adicional: usa --confirm-delete además de --confirm."
+        )
+    if full_table and not args.allow_full_table:
+        raise TabularError(
+            "UPDATE/DELETE sin WHERE requiere --allow-full-table."
+        )
+    if destructive and not args.allow_destructive:
+        raise TabularError(
+            "DDL destructivo (DROP/RENAME) requiere --allow-destructive."
+        )
+    need_backup = args.backup or schema_change or destructive
+    if not reversible and not need_backup and not args.allow_irreversible:
+        raise TabularError(
+            "La operación no es reversible y no hay backup. "
+            "Usa --backup o --allow-irreversible de forma explícita."
+        )
+
+    backup_path: Path | None = None
+    if need_backup:
+        backup_path = backup_database(
+            db_path, root, "pre-schema" if schema_change else "pre-mutate",
+            keep=args.keep_backups,
+        )
+
+    changes_dir = root / "reports" / "changes"
+    changes_dir.mkdir(parents=True, exist_ok=True)
+    base = unique_change_base(
+        changes_dir, f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{kinds[0]}"
+    )
+    sql_path = changes_dir / f"{base}.sql"
+    undo_path = changes_dir / f"{base}_undo.sql" if reversible and undo_sql else None
+    report_path = changes_dir / f"{base}.md"
+    schema_before_path = None
+    schema_after_path = None
+    if schema_change:
+        history_dir = root / "schema" / "history"
+        history_dir.mkdir(parents=True, exist_ok=True)
+        schema_before_path = history_dir / f"schema_{base}_before.sql"
+        schema_after_path = history_dir / f"schema_{base}_after.sql"
+
+    try:
+        sql_path.write_text(sql_text.rstrip() + "\n", encoding="utf-8")
+        if undo_path is not None and undo_sql is not None:
+            undo_path.write_text(
+                "-- Undo generado por tabular. Revísalo antes de aplicarlo.\n"
+                + undo_sql,
+                encoding="utf-8",
+            )
+        if schema_before_path is not None and result["before_schema"] is not None:
+            schema_before_path.write_text(result["before_schema"], encoding="utf-8")
+        if schema_after_path is not None and result["after_schema"] is not None:
+            schema_after_path.write_text(result["after_schema"], encoding="utf-8")
+
+        with closing(connect_readwrite(db_path)) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                result = execute_mutation_statements(
+                    conn, statements, kinds, args.capture_sql
+                )
+                reversible, undo_sql = compute_undo(statements, kinds, result)
+                if not reversible and not need_backup and not args.allow_irreversible:
+                    raise TabularError(
+                        "La operación no es reversible y no hay backup. "
+                        "Usa --backup o --allow-irreversible de forma explícita."
+                    )
+                if reversible and undo_path is None:
+                    undo_path = changes_dir / f"{base}_undo.sql"
+                if not reversible and undo_path is not None:
+                    if undo_path.exists():
+                        try:
+                            undo_path.unlink()
+                        except OSError:
+                            pass
+                    undo_path = None
+                if undo_sql is None and not schema_change and "No hay undo automático" not in " ".join(warnings):
+                    warnings.append("No hay undo automático para esta operación.")
+                if schema_change:
+                    warnings.append(
+                        "La estructura cambió. Ejecuta `schema --check` y actualiza "
+                        "mapping.json si es necesario."
+                    )
+                if undo_path is not None and undo_sql is not None:
+                    undo_path.write_text(
+                        "-- Undo generado por tabular. Revísalo antes de aplicarlo.\n"
+                        + undo_sql,
+                        encoding="utf-8",
+                    )
+                if schema_before_path is not None and result["before_schema"] is not None:
+                    schema_before_path.write_text(result["before_schema"], encoding="utf-8")
+                if schema_after_path is not None and result["after_schema"] is not None:
+                    schema_after_path.write_text(result["after_schema"], encoding="utf-8")
+
+                mapping_path = root / "schema" / "mapping.json"
+                mapping_hash = sha256_file(mapping_path) if mapping_path.exists() else None
+                summary = (
+                    history_summary(statements[0], kinds[0])
+                    if len(statements) == 1
+                    else f"{len(statements)} sentencias: " + ", ".join(kinds)
+                )
+                cursor = conn.execute(
+                    'INSERT INTO "_changes" '
+                    '("executed_at", "kind", "sql_text", "summary", "affected_rows", '
+                    '"reversible", "undo_path", "backup_path", "schema_before", '
+                    '"schema_after", "mapping_sha256", "tool_version") '
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        datetime.now().astimezone().isoformat(timespec="seconds"),
+                        kinds[0] if len(set(kinds)) == 1 else "mixed",
+                        sql_text,
+                        summary,
+                        sum(result["rowcounts"]),
+                        1 if reversible else 0,
+                        relative_to_root(undo_path, root) if undo_path else None,
+                        relative_to_root(backup_path, root) if backup_path else None,
+                        relative_to_root(schema_before_path, root) if schema_before_path else None,
+                        relative_to_root(schema_after_path, root) if schema_after_path else None,
+                        mapping_hash,
+                        VERSION,
+                    ),
+                )
+                change_id = cursor.lastrowid
+                write_change_report(
+                    report_path,
+                    "confirmado",
+                    sql_text,
+                    kinds,
+                    result,
+                    reversible,
+                    undo_path,
+                    backup_path,
+                    warnings,
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        if schema_change:
+            with closing(connect_readonly(db_path)) as conn:
+                write_schema_sql(conn, root)
+        with closing(connect_readwrite(db_path)) as conn:
+            prune_undo_history(conn, root, args.keep_history)
+
+        print(
+            mutation_summary(
+                "confirmado",
+                sql_text,
+                kinds,
+                result,
+                reversible,
+                undo_path,
+                backup_path,
+                warnings,
+            )
+        )
+        print(f"\nCambio registrado en `_changes` id={change_id}.")
+    except Exception:
+        for path in (sql_path, undo_path, report_path, schema_before_path, schema_after_path):
+            if path is not None and path.exists():
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+        raise
+    return 0
+
+
+def cmd_history(args: argparse.Namespace) -> int:
+    if args.limit < 1:
+        raise TabularError("--limit debe ser mayor que cero.")
+    db_path = resolve_db(args.db)
+    with closing(connect_readonly(db_path)) as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_changes'"
+        ).fetchone()
+        if not exists:
+            raise TabularError("No existe la tabla _changes en esta base.")
+        if args.show:
+            row = conn.execute(
+                'SELECT * FROM "_changes" WHERE id = ?', (args.show,)
+            ).fetchone()
+            if not row:
+                raise TabularError(f"No existe el cambio {args.show}.")
+            if args.format == "json":
+                print(json.dumps(dict(row), ensure_ascii=False, indent=2))
+                return 0
+            print("# Cambio " + str(row["id"]))
+            print()
+            print(f"- Fecha: {row['executed_at']}")
+            print(f"- Tipo: `{row['kind']}`")
+            print(f"- Filas afectadas: {row['affected_rows']}")
+            print(f"- Reversible: {'sí' if row['reversible'] else 'no'}")
+            if row["undo_path"]:
+                undo_path = Path(row["undo_path"])
+                if not undo_path.is_absolute():
+                    undo_path = Path.cwd() / undo_path
+                print(f"- Undo: `{row['undo_path']}` ({'existe' if undo_path.exists() else 'no disponible'})")
+            if row["backup_path"]:
+                print(f"- Backup: `{row['backup_path']}`")
+            if row["schema_before"]:
+                print(f"- Esquema antes: `{row['schema_before']}`")
+            if row["schema_after"]:
+                print(f"- Esquema después: `{row['schema_after']}`")
+            print()
+            print("```sql")
+            print(row["sql_text"].strip())
+            print("```")
+            return 0
+
+        rows = conn.execute(
+            'SELECT id, executed_at, kind, affected_rows, reversible, summary '
+            'FROM "_changes" ORDER BY id DESC LIMIT ?',
+            (args.limit,),
+        ).fetchall()
+    data = [dict(row) for row in rows]
+    if args.format == "json":
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return 0
+    print("# Historial de cambios")
+    print()
+    print(
+        format_table(
+            ["ID", "Fecha", "Tipo", "Filas", "Reversible", "Resumen"],
+            [
+                [
+                    row["id"],
+                    row["executed_at"],
+                    row["kind"],
+                    row["affected_rows"],
+                    "sí" if row["reversible"] else "no",
+                    row["summary"],
+                ]
+                for row in data
+            ],
+            max_width=50,
+        )
+    )
+    return 0
+
+
+def cmd_schema(args: argparse.Namespace) -> int:
+    mapping_path = Path(args.mapping).expanduser().resolve() if args.mapping else None
+    root = resolve_root(mapping_path) if mapping_path else Path.cwd().resolve()
+    db_path = resolve_db(args.db, root)
+
+    if args.write:
+        with closing(connect_readonly(db_path)) as conn:
+            path = write_schema_sql(conn, root)
+        print(f"Esquema escrito en {path}")
+        return 0
+
+    if args.check:
+        if mapping_path is None:
+            mapping_path = root / "schema" / "mapping.json"
+        if not mapping_path.exists():
+            raise TabularError(
+                f"No existe el mapping: {mapping_path}. Usa --mapping o crea schema/mapping.json."
+            )
+        mapping = load_mapping(mapping_path)
+        with closing(connect_readonly(db_path)) as conn:
+            drift = check_mapping_drift(conn, mapping)
+        if args.format == "json":
+            print(json.dumps(drift, ensure_ascii=False, indent=2))
+        else:
+            print("# Diferencias entre mapping y base")
+            print()
+            if not drift:
+                print("Sin diferencias: el mapping coincide con la base.")
+            else:
+                print(
+                    format_table(
+                        ["Tipo", "Tabla", "Detalle"],
+                        [
+                            [item["type"], item["table"], item["detail"]]
+                            for item in drift
+                        ],
+                    )
+                )
+        return 0 if not drift else 2
+
     with closing(connect_readonly(db_path)) as conn:
         objects = conn.execute(
             "SELECT name, type, sql FROM sqlite_master "
@@ -2197,18 +3195,40 @@ def build_parser() -> argparse.ArgumentParser:
     profile.add_argument("--max-rows", type=int, default=None, help="Limita filas para el perfil")
     profile.set_defaults(func=cmd_profile)
 
-    load = subparsers.add_parser("load", help="Carga el CSV en SQLite según mapping.json")
-    load.add_argument("mapping", help="Ruta a schema/mapping.json")
-    load.add_argument("--db", default=None, help="Ruta de la base SQLite")
-    load.add_argument("--dry-run", action="store_true", help="Simula la carga sin escribir la base")
-    load.add_argument("--allow-rejects", action="store_true", help="Carga filas válidas y omite rechazos")
-    load.add_argument("--no-report", action="store_true", help="No escribe reports/rechazos.csv")
-    load.set_defaults(func=cmd_load)
+    init = subparsers.add_parser(
+        "init", help="Importa el CSV una sola vez y crea la base"
+    )
+    init.add_argument("mapping", help="Ruta a schema/mapping.json")
+    init.add_argument("--csv", default=None, help="CSV a importar (reemplaza source.path)")
+    init.add_argument("--db", default=None, help="Ruta de la base SQLite")
+    init.add_argument(
+        "--archive-dir", default="data/imports", help="Directorio para archivar el CSV"
+    )
+    init.add_argument(
+        "--delete-source",
+        action="store_true",
+        help="Borra el CSV original después de archivar y verificar",
+    )
+    init.add_argument(
+        "--force",
+        action="store_true",
+        help="Recrea una base existente con backup previo",
+    )
+    init.add_argument(
+        "--allow-rejects", action="store_true", help="Carga filas válidas y omite rechazos"
+    )
+    init.add_argument(
+        "--no-report", action="store_true", help="No escribe reports/rechazos.csv"
+    )
+    init.set_defaults(func=cmd_init)
 
-    verify = subparsers.add_parser("verify", help="Verifica la base contra el CSV")
+    verify = subparsers.add_parser("verify", help="Verifica la integridad de la base")
     verify.add_argument("--db", default=None, help="Ruta de la base SQLite")
-    verify.add_argument("--mapping", default=None, help="Ruta a schema/mapping.json")
-    verify.add_argument("--allow-rejects", action="store_true", help="Acepta rechazos documentados")
+    verify.add_argument(
+        "--integrity",
+        action="store_true",
+        help="Verifica integridad, FKs y metadatos (modo por defecto)",
+    )
     verify.add_argument("--format", choices=["table", "json"], default="table")
     verify.set_defaults(func=cmd_verify)
 
@@ -2222,8 +3242,71 @@ def build_parser() -> argparse.ArgumentParser:
     query.add_argument("--out", default=None, help="Archivo de salida CSV o JSON")
     query.set_defaults(func=cmd_query)
 
+    mutate = subparsers.add_parser(
+        "mutate", help="Ejecuta DML/DDL en una transacción, con rollback por defecto"
+    )
+    mutate.add_argument("--sql", default=None, help="SQL a ejecutar")
+    mutate.add_argument("--file", default=None, help="Archivo .sql a ejecutar")
+    mutate.add_argument("--db", default=None, help="Ruta de la base SQLite")
+    mutate.add_argument(
+        "--capture-sql",
+        default=None,
+        help="SELECT para capturar el antes de un UPDATE y generar undo",
+    )
+    mutate.add_argument("--confirm", action="store_true", help="Aplica el cambio")
+    mutate.add_argument(
+        "--confirm-delete",
+        action="store_true",
+        help="Confirmación adicional obligatoria para DELETE",
+    )
+    mutate.add_argument(
+        "--allow-irreversible",
+        action="store_true",
+        help="Permite aplicar sin undo y sin backup",
+    )
+    mutate.add_argument(
+        "--allow-destructive",
+        action="store_true",
+        help="Permite DROP/RENAME en DDL",
+    )
+    mutate.add_argument(
+        "--allow-full-table",
+        action="store_true",
+        help="Permite UPDATE/DELETE sin WHERE",
+    )
+    mutate.add_argument(
+        "--backup", action="store_true", help="Fuerza backup completo antes de aplicar"
+    )
+    mutate.add_argument(
+        "--keep-history",
+        type=int,
+        default=UNDO_RETENTION,
+        help="Cantidad de undo files a conservar",
+    )
+    mutate.add_argument(
+        "--keep-backups",
+        type=int,
+        default=BACKUP_RETENTION,
+        help="Cantidad de backups completos a conservar",
+    )
+    mutate.set_defaults(func=cmd_mutate)
+
+    history = subparsers.add_parser("history", help="Muestra el historial de cambios")
+    history.add_argument("--db", default=None, help="Ruta de la base SQLite")
+    history.add_argument("--limit", type=int, default=20, help="Cantidad de cambios")
+    history.add_argument("--show", type=int, default=None, help="Muestra un cambio por ID")
+    history.add_argument("--format", choices=["table", "json"], default="table")
+    history.set_defaults(func=cmd_history)
+
     schema = subparsers.add_parser("schema", help="Muestra tablas, columnas y DDL")
     schema.add_argument("--db", default=None, help="Ruta de la base SQLite")
+    schema.add_argument("--mapping", default=None, help="Ruta a schema/mapping.json")
+    schema.add_argument(
+        "--check", action="store_true", help="Compara mapping contra la base"
+    )
+    schema.add_argument(
+        "--write", action="store_true", help="Regenera schema/schema.sql desde la base"
+    )
     schema.add_argument("--format", choices=["table", "json", "sql"], default="table")
     schema.set_defaults(func=cmd_schema)
 
@@ -2238,7 +3321,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        if args.command in {"load", "verify", "query", "schema"}:
+        if args.command in {"init", "verify", "query", "schema", "mutate", "history"}:
             ensure_sqlite_supported()
         return int(args.func(args))
     except TabularError as exc:
