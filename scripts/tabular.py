@@ -880,6 +880,10 @@ def normalize_numeric_text(value: str, decimal: str, thousands: str) -> str:
     if decimal == thousands:
         raise TabularError("locale.decimal y locale.thousands no pueden ser iguales")
     text = value.strip().replace("\u00a0", " ").replace(" ", "")
+    # Notación científica (p. ej. 5.82E-11): Decimal la entiende, pero el
+    # filtrado de caracteres de abajo eliminaría la "E" y corrompería el valor.
+    if re.fullmatch(r"[+-]?\d+(?:[.,]\d+)?[eE][+-]?\d+", text):
+        return text.replace(",", ".")
     negative_parentheses = text.startswith("(") and text.endswith(")")
     if negative_parentheses:
         text = text[1:-1]
