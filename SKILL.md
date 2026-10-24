@@ -1,228 +1,187 @@
 ---
 name: tabular
 description: >
-  Limpieza, normalización y gestión de datos CSV con uv, pandas y SQLite.
-  Importa un CSV una sola vez, archiva la fuente y convierte la base SQLite en
-  la fuente de verdad para consultar y mutar con CRUD y DDL controlado. Úsala
-  siempre que el usuario comparta un CSV, pida limpiar o normalizar datos,
-  crear una base, consultar, actualizar o eliminar registros, agregar columnas,
-  o crear funciones de consulta reutilizables, aunque no mencione pandas,
-  SQLite ni normalización. Trabaja exclusivamente con CSV: si el usuario trae
-  XLSX o XLS, pídele exportarlo a CSV UTF-8; no proceses hojas de cálculo. No
-  usar para editar formato de Excel, PDFs, scraping ni dashboards.
+  Análisis y limpieza de cualquier CSV, creación de una base SQLite y runtime
+  CRUD para trabajar esa base. Usa csvsqlite como herramienta temporal de
+  validación, plantilla y construcción; después conserva solo la plantilla, el
+  CSV archivado, la base SQLite y tabular.py. Úsala cuando el usuario comparta
+  un CSV, pida validar o limpiar datos, crear una base, consultar, actualizar o
+  eliminar registros, agregar columnas o crear funciones reutilizables, aunque
+  no mencione pandas, SQLite ni normalización. Solo CSV; si trae XLSX, pide
+  exportarlo a CSV UTF-8. No usar para editar formato de Excel, PDFs, scraping
+  ni dashboards.
 license: MIT
-compatibility: Requiere uv, Python 3.12+ y SQLite. Solo entrada CSV. Funciona en Windows, macOS y Linux.
+compatibility: Requiere uv, Python 3.12+ y SQLite. Solo entrada CSV. Windows, macOS y Linux.
 metadata:
-  version: "0.3.0-rc1"
+  version: "0.4.0-rc1"
   opencode/slash: "true"
 ---
 
 # tabular
 
-El CSV es la semilla. Después de `init`, **la base SQLite es la fuente de
-verdad** y el proyecto se trabaja con consultas, CRUD y cambios de estructura
-controlados.
+Dos herramientas con dos ciclos de vida:
 
-La IA decide y explica; `scripts/tabular.py` ejecuta, valida y deja historial.
+```text
+csvsqlite.py   → andamio temporal: check → init → build
+plantilla.yaml → documentación del esquema (se conserva)
+proyecto.sqlite → base definitiva (se conserva)
+tabular.py     → runtime permanente: query / mutate / history / schema / verify
+CSV            → se conserva archivado
+```
+
+`csvsqlite.py` se usa una vez y se elimina del proyecto. `tabular.py` se queda.
 
 ## Entrada válida: solo CSV
 
-Acepta únicamente archivos `.csv`. Si el usuario adjunta `.xlsx` o `.xls`:
+Acepta únicamente `.csv`. Si el usuario adjunta `.xlsx` o `.xls`:
 
 1. No lo abras.
 2. No instales `openpyxl` ni conviertas con LibreOffice.
-3. Responde: “Solo proceso CSV. Guarda la hoja como CSV UTF-8 y vuelve a
-   subirla.”
-4. Espera el CSV antes de crear el proyecto.
-
-`tabular.py` también rechaza cualquier archivo que no termine en `.csv`.
+3. Pide: “Guarda la hoja como CSV UTF-8 y vuelve a subirla.”
+4. Espera el CSV.
 
 ## Principios
 
-1. **El CSV se importa una sola vez.** `init` crea la base, verifica, archiva
-   el CSV y registra su SHA-256 en `_imports`.
-2. **Después, la base manda.** No se reconstruye desde el CSV en cada consulta.
-3. **Todo cambio de datos pasa por `mutate`.** `query` es solo lectura.
-4. **Nada se aplica sin confirmación.** `mutate` hace rollback por defecto;
-   solo con `--confirm` aplica.
-5. **`DELETE` pide confirmación extra.** Usa `--confirm-delete`; si no hay
-   undo, exige `--allow-irreversible` o `--backup`.
-6. **DDL destructivo pide confirmación extra.** `DROP`/`RENAME` requiere
-   `--allow-destructive` además de `--confirm`.
-7. **Todo cambio deja historial.** `_changes`, `reports/changes/`, backups y
-   snapshots de esquema.
-8. **Si `verify --integrity` falla, no se entrega.**
-9. **El mapping ayuda al agente, pero después de un DDL puede quedar viejo.**
-   Usa `schema --check` y `schema --write`.
+1. **Cualquier CSV es válido como punto de partida.** No asumas clientes,
+   productos ni tablas concretas.
+2. **Por defecto, una sola tabla plana.** Separar columnas repetidas en tablas
+   relacionadas es opcional y se pregunta al usuario.
+3. **La IA lee el reporte de `csvsqlite check`.** No interpreta el CSV a ciegas.
+4. **El dinero se confirma con el humano.** Si una columna es dinero, se avisa
+   que se guardará en centavos: `286.96` → `28696`.
+5. **`csvsqlite build` deja la base lista:** `id`, centavos, `_imports`,
+   `_changes`, `schema.sql`, CSV archivado.
+6. **Después, la base SQLite es la fuente de verdad.** El CSV no se reimporta.
+7. **Todo cambio pasa por `tabular mutate`.** `query` es solo lectura.
+8. **Nada se aplica sin confirmación.** `mutate` hace rollback por defecto.
+9. **Todo cambio deja historial.** `_changes`, undo y backups.
+10. **La plantilla es documentación.** `tabular` no la parsea; la estructura
+    real está en SQLite y en `schema.sql`.
 
 ## Flujo
 
-### 0. Identificar CSV y proyecto
+### 1. Validar el CSV (temporal)
 
-Deriva un nombre snake_case: `ventas_enero.csv` → `ventas_enero`. Un proyecto
-corresponde a un CSV inicial. Si hay varios, crea un proyecto por archivo.
-
-### 1. Preparar el proyecto
-
-Sigue `references/setup.md` para instalar uv, crear el proyecto, copiar
-`tabular.py`, crear carpetas y configurar `.gitignore`. En Windows usa el
-bloque PowerShell de ese archivo.
-
-Los comandos posteriores son iguales en todos los sistemas:
+Copia `scripts/csvsqlite.py` al proyecto de forma temporal, o ejecútalo desde
+la skill. Después se elimina del proyecto.
 
 ```bash
-uv run python scripts/tabular.py ...
+python scripts/csvsqlite.py check "datos.csv" -o reports/check_datos.md
 ```
 
-### 2. Perfilar el CSV
+`check` detecta encoding, delimitador, tipos, fechas ambiguas, notación
+científica, columnas mixtas, nulos, cabeceras y filas irregulares. No modifica
+el CSV.
+
+Si hay falsos bloqueantes en columnas de texto que contienen números:
 
 ```bash
-uv run python scripts/tabular.py profile data/raw/ventas_enero.csv
+python scripts/csvsqlite.py check "datos.csv" \
+  --forzar-texto "Nro Factura" --forzar-texto "COMENTARIOS FC" \
+  -o reports/check_datos.md
 ```
 
-Genera `schema/profile.json`. Revisa encoding, delimitador, encabezado,
-duplicados, nulos, tipos, footer y candidatos a clave/dimensión.
-
-Si el perfil se equivocó de encabezado o delimitador, repite con
-`--header-row`, `--delimiter` o `--encoding`. No edites el CSV.
-
-### 3. Interpretar y escribir el mapping
-
-Lee `references/data-guide.md` para la especificación completa. El mapping
-declara grano, tablas, dimensiones, hechos, claves, tipos y FKs.
-
-Reglas rápidas:
-
-- `id` se agrega automáticamente.
-- `kind` es `dimension` o `fact`.
-- Toda dimensión necesita `key`.
-- `MONEY` se guarda en centavos.
-- `DATE` se guarda como `YYYY-MM-DD`.
-- IDs con ceros iniciales se declaran `TEXT`.
-- Encabezados duplicados o vacíos usan `source_index` (1-based).
-
-Pregunta al humano solo si hay ambigüedad real: grano, fechas
-`dd/mm` vs `mm/dd`, clave con conflictos, filas de totales o moneda.
-
-### 4. Importar una sola vez
+Para CSV con títulos o totales:
 
 ```bash
-uv run python scripts/tabular.py init schema/mapping.json
+--header-row 3 --footer-rows 1
 ```
 
-`init`:
+### 2. Preguntar al humano
 
-1. construye una base temporal;
-2. valida el mapping y convierte los datos;
-3. verifica conteos, totales, FKs e integridad;
-4. archiva el CSV en `data/imports/AAAA-MM-DD_nombre.csv` como solo lectura;
-5. registra `_imports` y el primer `_changes`;
-6. reemplaza la base de forma atómica;
-7. escribe `schema/schema.sql`.
+La IA lee el reporte y pregunta solo lo necesario:
 
-Si hay filas rechazadas, revisa `reports/rechazos.csv` (solo se crea si hay
-rechazos). Solo usa `--allow-rejects` tras decidir que esos rechazos son
-aceptables. `init` ya escribe `schema/schema.sql`; `schema --write` solo es
-necesario después de un DDL o de cambiar una vista.
+- ¿Cómo se llama la tabla principal? Propón el nombre del CSV.
+- ¿Qué columnas son dinero? ¿En qué moneda? ¿Confirmas centavos?
+- ¿Hay columnas repetitivas que quieras separar en una tabla relacionada?
+- ¿Las fechas son `dd/mm` o `mm/dd`?
+- ¿Hay filas de totales o encabezados desplazados?
+- ¿Los bloqueantes son datos reales o columnas de texto con números?
 
-Si ya existe una base, `init` se niega. `init --force` hace backup y recrea;
-pierde los cambios e historial de la base. `--delete-source` borra el CSV
-original solo después de archivar y verificar.
+No conviertas dinero ni separes tablas sin confirmación.
 
-### 5. Reporte inicial
-
-Escribe `reports/ANALISIS.md` con la plantilla de `references/templates.md`.
-Incluye tablas, filas, decisiones, calidad, consultas de ejemplo y cómo
-reconstruir.
-
-### 6. Trabajo diario: consultas
+### 3. Generar la plantilla
 
 ```bash
-uv run python scripts/tabular.py query "SELECT ..."
-uv run python scripts/tabular.py query --file sql/queries/ventas_mes.sql
-uv run python scripts/tabular.py schema
-uv run python scripts/tabular.py verify --integrity
+python scripts/csvsqlite.py init "datos.csv" --tabla datos -o plantilla.yaml
 ```
 
-- `query` solo permite `SELECT`, `WITH` y `EXPLAIN`.
-- Responde primero el dato, después el contexto.
-- Si la pregunta pide una cifra, ejecútala; no la calcules de memoria.
-- Para consultas frecuentes, guarda SQL en `sql/queries/`.
-- `init` aplica las vistas de `sql/views/`. Después de `init`, para crear o
-  cambiar una vista usa `mutate` y luego `schema --write`.
+Revisa `plantilla.yaml`:
 
-### 7. CRUD y mutaciones
+- `tabla`: nombre de la tabla principal.
+- `nombre_db`: nombre de cada columna en SQLite.
+- `tipo`: `TEXT`, `INTEGER`, `REAL`, `DECIMAL`, `MONEY`, `BOOLEAN`, `DATE`,
+  `DATETIME`, `TIME`.
+- `MONEY` se guarda en centavos enteros.
+- `separar_en` + `columna_tabla_separada`: extrae una columna repetitiva a una
+  tabla relacionada. Es opcional.
+- `clave_primaria`: clave natural única (se implementa como `UNIQUE`; el `id`
+  interno sigue siendo la PK).
+- `unico`, `indice`, `enum`, `formato_fuente`, `mapeo`.
 
-`mutate` es el único punto de escritura. Por defecto hace rollback; con
-`--confirm` aplica.
+### 4. Construir la base
 
 ```bash
-# simulación
-uv run python scripts/tabular.py mutate --sql "UPDATE ventas SET cantidad=3 WHERE id=42"
+python scripts/csvsqlite.py build "datos.csv" \
+  -s plantilla.yaml \
+  -o db/datos.sqlite \
+  --raiz .
+```
+
+`build`:
+
+1. valida todos los valores contra la plantilla;
+2. crea la tabla principal con `id INTEGER PRIMARY KEY` y `_source_row`;
+3. crea tablas relacionadas si hay `separar_en`;
+4. convierte dinero a centavos;
+5. activa `PRAGMA foreign_keys=ON`;
+6. archiva el CSV en `data/imports/AAAA-MM-DD_nombre.csv`;
+7. crea `_imports` y `_changes`;
+8. escribe `schema/schema.sql`;
+9. escribe `db/datos.sqlite`.
+
+Si hay errores, no escribe la base y genera un reporte de errores.
+
+Después de construir:
+
+```bash
+rm scripts/csvsqlite.py
+```
+
+El CSV queda archivado; no se borra.
+
+### 5. Trabajo diario con `tabular.py`
+
+```bash
+python scripts/tabular.py query "SELECT ..."
+python scripts/tabular.py schema
+python scripts/tabular.py schema --write
+python scripts/tabular.py verify --integrity
+python scripts/tabular.py history
+```
+
+`tabular.py` no lee CSV, no crea la base y no usa pandas.
+
+### 6. CRUD y DDL
+
+```bash
+# simulación: rollback
+python scripts/tabular.py mutate --sql "UPDATE datos SET ... WHERE id=1"
 
 # aplicar
-uv run python scripts/tabular.py mutate --sql "UPDATE ventas SET cantidad=3 WHERE id=42" --confirm
+python scripts/tabular.py mutate --sql "UPDATE datos SET ... WHERE id=1" --confirm
 ```
 
-Antes de aplicar, muestra al usuario:
+Antes de aplicar, muestra:
 
 - qué cambia;
 - cuántas filas;
 - si hay undo;
 - si hay backup;
-- cualquier advertencia.
+- advertencias.
 
-Nunca uses `--confirm` sin un “sí” explícito del usuario. Si trabajas en un
-subagente sin humano, detente en el dry-run y no apliques; solo aplica si el
-prompt del usuario autorizó explícitamente esa mutación. El protocolo detallado
-y los flags están en `references/mutate.md`.
-
-### 8. Cambios de estructura
-
-`mutate` también acepta DDL:
-
-```bash
-uv run python scripts/tabular.py mutate --sql "ALTER TABLE ventas ADD COLUMN descuento_centavos INTEGER" --confirm
-```
-
-- Los DDL hacen backup y snapshot del esquema.
-- `DROP`/`RENAME` requieren `--allow-destructive`.
-- Después de un DDL, ejecuta `schema --check`; si hay diferencias, actualiza
-  `mapping.json` o `schema.sql`.
-
-### 9. Historial y undo
-
-```bash
-uv run python scripts/tabular.py history
-uv run python scripts/tabular.py history --show 7
-```
-
-Para revertir una operación con undo:
-
-```bash
-uv run python scripts/tabular.py mutate --file reports/changes/<timestamp>_<tipo>_undo.sql --confirm
-```
-
-`DELETE`/`INSERT` generan undo automático con `RETURNING`. `UPDATE` captura el
-antes con una consulta. Si no se puede generar undo, el script lo advierte y
-exige backup o `--allow-irreversible`.
-
-### 10. Funciones persistentes
-
-Crea `functions/func_<nombre>.py` con conexión de solo lectura y un diccionario
-`META` (nombre, descripción, parámetros con tipo/requerido). Las fechas de
-corte se reciben como argumentos; nunca uses `date('now')`.
-
-Registra la función en `FUNCTIONS.md` y pruébala antes de entregar. La
-plantilla está en `references/templates.md`.
-
-## Confirmación antes de escribir
-
-1. Ejecuta `mutate` sin `--confirm`.
-2. Muestra el resumen y las filas afectadas.
-3. Pregunta: “¿Confirmas?”. Para `DELETE`, di cuántas filas se borran y si hay
-   undo. Si no hay undo, dilo y ofrece backup o cancelar.
-4. Solo tras un “sí”, ejecuta con `--confirm` y el flag extra que corresponda.
+Nunca uses `--confirm` sin un “sí” explícito. En un subagente sin humano,
+detente en el dry-run; solo aplica si el prompt autorizó esa mutación.
 
 Flags:
 
@@ -232,33 +191,85 @@ Flags:
 - `--allow-destructive`: `DROP`/`RENAME`.
 - `--allow-full-table`: `UPDATE`/`DELETE` sin `WHERE`.
 - `--backup`: forzar backup completo.
-- `--capture-sql`: SELECT previo para undo de `UPDATE`.
+- `--capture-sql`: SELECT previo para undo de un `UPDATE`.
+
+### 7. Historial y undo
+
+```bash
+python scripts/tabular.py history
+python scripts/tabular.py history --show 7
+python scripts/tabular.py mutate --file reports/changes/<timestamp>_<tipo>_undo.sql --confirm
+```
+
+`_changes` registra cada operación. `reports/changes/` guarda SQL, undo y
+reporte. `db/backups/` guarda backups de DDL/destructivos o `--backup`.
+Retención por defecto: 100 undo y 10 backups.
+
+### 8. Funciones persistentes
+
+Crea `functions/func_<nombre>.py` con conexión de solo lectura y `META`
+(nombre, descripción, parámetros con tipo/requerido). Las fechas de corte se
+reciben como argumentos; nunca `date('now')`.
+
+Registra la función en `FUNCTIONS.md` y pruébala. Plantilla en
+`references/templates.md`.
+
+## Confirmación antes de escribir
+
+1. Ejecuta `mutate` sin `--confirm`.
+2. Muestra resumen y filas afectadas.
+3. Pregunta: “¿Confirmas?”.
+4. Para `DELETE`, di cuántas filas y si hay undo.
+5. Solo tras un “sí”, aplica con `--confirm` y el flag extra.
+
+## Qué queda en el proyecto
+
+```text
+proyecto/
+├── db/datos.sqlite
+├── data/imports/AAAA-MM-DD_datos.csv
+├── plantilla.yaml
+├── schema/schema.sql
+├── scripts/tabular.py
+├── sql/queries/
+├── sql/views/
+├── functions/
+├── FUNCTIONS.md
+├── reports/ANALISIS.md
+├── reports/check_datos.md
+└── README.md
+```
+
+Sin `csvsqlite.py`, sin `mapping.json`, sin `profile.json`, sin pandas.
 
 ## Anti-patrones
 
-- Reconstruir la base desde el CSV después de `init`.
-- Editar el `.sqlite` con DB Browser en lugar de `mutate`.
-- Ejecutar `mutate --confirm` sin mostrar el resumen al usuario.
-- Borrar sin `--confirm-delete`.
+- Reimportar el CSV después de crear la base.
+- Leer el CSV completo en el contexto en vez de usar `check`.
+- Separar tablas sin preguntar.
+- Convertir dinero a centavos sin avisar.
+- Editar SQLite con DB Browser en vez de `mutate`.
+- Ejecutar `mutate --confirm` sin confirmación.
 - Ocultar que una operación no tiene undo.
-- Asumir que `mapping.json` sigue siendo la verdad después de un DDL.
-- Usar `date('now')` en una función persistente.
-- Exportar o procesar XLSX.
+- Usar `date('now')` en funciones.
+- Procesar XLSX.
 
 ## Criterio de terminado
 
-- Existe `uv.lock` y el proyecto corre con `uv run`.
-- Existen `schema/profile.json`, `schema/mapping.json` y `schema/schema.sql`.
-- `init` verificó y archivó el CSV; `_imports` tiene una fila.
+- `csvsqlite check` fue revisado y los bloqueantes explicados.
+- `plantilla.yaml` está ajustada.
+- `csvsqlite build` creó DB, `_imports`, `_changes` y `schema.sql`.
+- El CSV está archivado.
 - `verify --integrity` pasa.
 - `reports/ANALISIS.md` está escrito.
-- `schema --check` pasa o las diferencias están explicadas.
-- Las consultas de ejemplo funcionan.
-- No hay `openpyxl` ni archivos `.xlsx`.
+- `csvsqlite.py` fue eliminado del proyecto.
+- `tabular.py` funciona sin pandas.
+- No hay `.xlsx` ni `openpyxl`.
 
 ## Referencias
 
-- `references/setup.md`: instalación, Windows, scaffolding, backups.
-- `references/data-guide.md`: CSV, tipos, mapping, normalización, SQL.
-- `references/mutate.md`: CRUD, DDL, undo, confirmación e historial.
-- `references/templates.md`: `ANALISIS.md` y función con `META`.
+- `references/setup.md`: uv, proyecto, Windows, estructura.
+- `references/csvsqlite.md`: check/init/build, plantilla y separación.
+- `references/tabular.md`: query/mutate/history/schema/verify.
+- `references/data-guide.md`: trampas CSV, tipos, dinero, errores.
+- `references/templates.md`: `ANALISIS.md` y funciones con `META`.

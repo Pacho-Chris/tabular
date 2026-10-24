@@ -1,12 +1,12 @@
-# Instalación y creación del proyecto
+# Instalación y estructura del proyecto
 
 ## Requisitos
 
-- `uv` instalado y en el PATH.
-- Python 3.12 gestionado por uv. No hace falta instalarlo a mano.
-- pandas en el entorno del proyecto (`uv add pandas`).
-- SQLite viene incluido en Python. No instales el CLI.
-- Git es opcional para el proyecto generado.
+- `uv` para obtener Python 3.12 y ejecutar el código.
+- Python 3.12 gestionado por uv.
+- SQLite viene incluido en Python.
+- No se necesita pandas, openpyxl ni el CLI de SQLite.
+- Git es opcional para el proyecto.
 
 ## Instalar uv
 
@@ -28,7 +28,7 @@ o:
 powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
-Cierra y vuelve a abrir la terminal. Comprueba:
+Reinicia la terminal y comprueba:
 
 ```bash
 uv --version
@@ -36,7 +36,7 @@ uv --version
 
 ## Instalar la skill
 
-Copia la carpeta completa en una de estas rutas:
+La carpeta completa debe quedar en:
 
 ```text
 ~/.agents/skills/tabular/
@@ -50,26 +50,23 @@ C:\Users\<usuario>\.agents\skills\tabular\
 C:\Users\<usuario>\.config\opencode\skills\tabular\
 ```
 
-Debe quedar:
+Contenido:
 
 ```text
 tabular/
 ├── SKILL.md
 ├── references/
 │   ├── setup.md
+│   ├── csvsqlite.md
+│   ├── tabular.md
 │   ├── data-guide.md
-│   ├── mutate.md
 │   └── templates.md
 └── scripts/
+    ├── csvsqlite.py
     └── tabular.py
 ```
 
-No copies solo `SKILL.md`: sin `scripts/tabular.py` la skill no ejecuta nada.
-Reinicia OpenCode si no aparece en la lista de skills.
-
-`uv init` puede normalizar el nombre del paquete en `pyproject.toml`
-(`ventas_crud` → `ventas-crud`). La carpeta y la base conservan el nombre que
-elijas; no afecta a `tabular.py`.
+`csvsqlite.py` es temporal en cada proyecto. `tabular.py` se queda.
 
 ## Crear el proyecto
 
@@ -77,18 +74,21 @@ elijas; no afecta a `tabular.py`.
 
 ```bash
 SKILL_DIR="$HOME/.agents/skills/tabular"
-PROJECT="ventas_enero"
-CSV="/ruta/al/ventas_enero.csv"
+PROJECT="datos"
+CSV="/ruta/al/datos.csv"
 
 uv init --bare --python 3.12 --name "$PROJECT" "$PROJECT"
 cd "$PROJECT"
 uv python pin 3.12
-uv add pandas
 
-mkdir -p data/raw data/imports db/backups schema/history \
+mkdir -p data/imports db/backups schema/history \
   sql/views sql/queries functions reports/changes scripts
 
+# csvsqlite solo se necesita durante la construcción
+cp "$SKILL_DIR/scripts/csvsqlite.py" scripts/csvsqlite.py
+# tabular se queda en el proyecto
 cp "$SKILL_DIR/scripts/tabular.py" scripts/tabular.py
+
 cp "$CSV" "data/raw/$(basename "$CSV")"
 
 cat > .gitignore <<'EOF'
@@ -105,13 +105,12 @@ EOF
 
 ```powershell
 $SkillDir = Join-Path $env:USERPROFILE ".agents\skills\tabular"
-$Project  = "ventas_enero"
-$Csv      = "C:\datos\ventas_enero.csv"
+$Project  = "datos"
+$Csv      = "C:\datos\datos.csv"
 
 uv init --bare --python 3.12 --name $Project $Project
 Set-Location $Project
 uv python pin 3.12
-uv add pandas
 
 $dirs = @(
   "data\raw", "data\imports", "db\backups", "schema\history",
@@ -121,6 +120,7 @@ foreach ($dir in $dirs) {
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
 }
 
+Copy-Item (Join-Path $SkillDir "scripts\csvsqlite.py") "scripts\csvsqlite.py"
 Copy-Item (Join-Path $SkillDir "scripts\tabular.py") "scripts\tabular.py"
 Copy-Item $Csv (Join-Path "data\raw" (Split-Path $Csv -Leaf))
 
@@ -134,64 +134,57 @@ db/backups/
 "@ | Set-Content -Encoding ascii .gitignore
 ```
 
-## Estructura generada
+`uv` no necesita dependencias: ambos scripts usan solo la librería estándar.
+Se puede ejecutar con:
+
+```bash
+uv run python scripts/csvsqlite.py ...
+uv run python scripts/tabular.py ...
+```
+
+o directamente con `python`, si ya está disponible.
+
+`uv init` puede normalizar el nombre del paquete (`datos` → `datos`), pero la
+carpeta y la base conservan el nombre que elijas.
+
+## Estructura final
 
 ```text
-ventas_enero/
+proyecto/
 ├── pyproject.toml / uv.lock / .python-version / .gitignore
 ├── README.md
 ├── data/
-│   ├── raw/                 # CSV original mientras corre init
+│   ├── raw/                 # CSV mientras se construye
 │   └── imports/             # CSV archivado, solo lectura
 ├── db/
-│   ├── ventas_enero.sqlite
-│   └── backups/             # backups de estructura o --backup
+│   ├── datos.sqlite
+│   └── backups/
+├── plantilla.yaml
 ├── schema/
-│   ├── profile.json
-│   ├── mapping.json
 │   ├── schema.sql
-│   └── history/             # snapshots de esquema
+│   └── history/
+├── scripts/
+│   └── tabular.py           # csvsqlite se elimina al terminar
 ├── sql/
 │   ├── views/
 │   └── queries/
 ├── functions/
+├── FUNCTIONS.md
 ├── reports/
 │   ├── ANALISIS.md
-│   ├── rechazos.csv        # solo si init rechazó filas
-│   └── changes/             # SQL, undo y reportes de mutate
-├── scripts/tabular.py
-├── FUNCTIONS.md
-└── README.md
+│   ├── check_datos.md
+│   └── changes/
+└── .gitignore
 ```
-
-## Backups y retención
-
-- `init --force`: backup antes de recrear.
-- `mutate` con DDL o `--backup`: backup antes de aplicar.
-- `mutate` DML normal: undo log, no backup completo.
-- Backups en `db/backups/`, últimos 10 por defecto.
-- Undo en `reports/changes/`, últimos 100 por defecto.
-- Snapshots de esquema en `schema/history/`.
-
-No hay borrado automático de `_changes`; el historial de operaciones es texto y
-no pesa.
 
 ## Notas de Windows
 
 - Cierra Excel, DB Browser o cualquier programa que tenga abierto el CSV o la
-  base antes de `init` o `mutate`.
+  base antes de construir o mutar.
 - Evita OneDrive para el proyecto; puede bloquear `.venv`, la base y los
-  archivos temporales.
-- Usa una ruta corta, por ejemplo `C:\datos\ventas_enero`.
-- No uses `sqlite3`; usa `tabular.py query` o `schema`.
+  temporales.
+- Usa una ruta corta, por ejemplo `C:\datos\proyecto`.
 - Para el hash usa `Get-FileHash archivo.csv -Algorithm SHA256`.
+- Windows Terminal o PowerShell 7 muestran mejor UTF-8.
 - Si usas WSL, instala la skill en el home de Linux y evita `/mnt/c` para
   `.venv` y la base.
-- Windows Terminal o PowerShell 7 muestran mejor UTF-8.
-
-## Comprobar la instalación
-
-```bash
-uv run python scripts/tabular.py version
-uv run python scripts/tabular.py profile data/raw/ventas_enero.csv
-```
